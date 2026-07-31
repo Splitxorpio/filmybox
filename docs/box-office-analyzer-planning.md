@@ -219,3 +219,27 @@ Three paths were considered:
 3. **Managed inference endpoint** (e.g. SageMaker): fully hosted, autoscaled, but priced per endpoint-hour — overkill for GBTs at a few-thousand-movie dataset scale; really meant for GPU-bound/variable-load deep learning workloads.
 
 **Rationale for Path 1**: GBT inference on tabular features is fast and cheap (no GPU needed), retraining will happen infrequently (batch, as new box office results roll in) rather than continuously, and the project is pre-launch — decoupling buys flexibility not needed yet at real operational cost. Revisit if retraining cadence ever exceeds API deploy cadence, or if inference becomes a load bottleneck separate from API traffic.
+
+---
+
+## Project Scaffold (Built)
+
+Directory structure, docker-compose, and Postgres DDL are live in the repo:
+- `docker-compose.yml` — `postgres` (pgvector/pgvector:pg16), `redis`, `api` (FastAPI), `frontend` (Next.js), `prefect-worker`
+- `api/` — FastAPI app with `/health` checking Postgres + Redis connectivity
+- `frontend/` — Next.js app-router scaffold; server-rendered home page fetches API health over the internal Docker network (`API_INTERNAL_URL=http://api:8000`, distinct from the browser-facing `NEXT_PUBLIC_API_URL`)
+- `prefect-worker/` — runs a placeholder healthcheck flow on a 60s loop until a real Prefect Cloud workspace/API key is wired in
+- `db/init/001_schema.sql` — full DDL, auto-applied on first boot against an empty `postgres_data` volume
+
+Verified end-to-end: `docker compose up -d --build` brings up all 5 services; `curl localhost:8000/health` and `curl localhost:3000` both resolve correctly.
+
+### Postgres DDL — decisions made beyond the original Step 1 spec
+- **`box_office_results` split into two tables**: `box_office_totals` (one row per movie — opening weekend + lifetime totals) and `box_office_weekly` (the actual weekend-by-weekend time series needed for "legs"/drop-off). The original single-table description conflated a point-in-time fact with a time series.
+- **`franchises` table added**: needed as the target of `movies.franchise_id`, which the original schema referenced but didn't define.
+- **`movie_embeddings` table added now** (not in the original Step 1 list): backs the pgvector comp-similarity search already committed to in the Modeling Approach section. `VECTOR(384)` as a placeholder dimension (sentence-transformers MiniLM-class default) — will need to match whichever embedding model is actually used, since the column width is fixed. Empty until the embedding pipeline exists.
+- **Predictions/verdicts table deliberately deferred**: storing the dashboard's stage-by-stage verdict output is a modeling-stage concern: designing it now, before the staged models exist, risks guessing the wrong output shape. Revisit once the staged models are built.
+- **Check constraints over native Postgres enums**: for `role_type`, `tier`, `budget_confidence`, `trailer_type`, `stage`, `source` — easier to alter later than enum types, which have historically been awkward to modify without table locks.
+
+### Next steps
+- Write TMDb ingestion script (backbone layer: `movies`, `people`, `movie_credits`, `studios`)
+- Or continue building out the API/dashboard against the now-live schema
