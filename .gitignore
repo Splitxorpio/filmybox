@@ -1,0 +1,20 @@
+# env
+.env
+
+# node / next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# python
+**/__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# postgres / data
+db/data/
+
+# os
+.DS_Store
+Thumbs.db

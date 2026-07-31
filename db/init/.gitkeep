@@ -1,0 +1,5 @@
+Schema DDL (movies, people, movie_credits, box_office_results, studios,
+trailers, trailer_metrics, sentiment_snapshots) is a follow-up step per
+box-office-analyzer-planning.md. .sql files dropped here run automatically
+on first `docker compose up` (postgres image executes docker-entrypoint-initdb.d
+alphabetically, only on an empty data volume).
