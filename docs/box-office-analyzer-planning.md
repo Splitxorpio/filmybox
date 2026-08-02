@@ -243,3 +243,41 @@ Verified end-to-end: `docker compose up -d --build` brings up all 5 services; `c
 ### Next steps
 - Write TMDb ingestion script (backbone layer: `movies`, `people`, `movie_credits`, `studios`)
 - Or continue building out the API/dashboard against the now-live schema
+
+---
+
+## TMDb Backbone Ingestion (Built)
+
+`prefect-worker/flows/tmdb_backfill.py` populates `movies`, `studios`, `franchises`, `people`, and `movie_credits` from TMDb. Run manually:
+```
+docker compose run --rm --no-deps prefect-worker python -m flows.tmdb_backfill \
+    --start-date 2010-01-01 --end-date 2026-07-31 --min-vote-count 50
+```
+(`docker compose run`, not `exec` — see gotcha below.)
+
+### TMDb endpoint mapping
+- `GET /discover/movie` (`primary_release_date.gte/.lte`, `with_release_type=3` for wide theatrical only, `vote_count.gte` to filter obscure/straight-to-video) — candidate movie id discovery
+- `GET /movie/{id}?append_to_response=credits,release_dates` — one call gets details + full cast/crew + release-by-country data, collapsing what would otherwise be 3 separate calls
+- MPAA rating isn't on the base details payload — extracted from `release_dates.results[iso_3166_1=="US"]`, preferring the `type: 3` (Theatrical) certification
+- `GET /person/{id}` — birthday/imdb_id per new person only (existing people are looked up by `tmdb_id` first, so this call is skipped for anyone already backfilled)
+- `belongs_to_collection` (free on movie details) maps directly onto our `franchises` table — no extra call needed for franchise linking
+
+### Schema tweak made while building this
+Added `studios.tmdb_company_id` and `franchises.tmdb_collection_id` (both `UNIQUE`) — the original DDL deduped both by `name` string, which conflicts with the "never match on name string" rule already applied to `people`. Migrated live via `ALTER TABLE` since both tables were still empty.
+
+### Design decisions
+- **Cast capped at billing order < 15** (`CAST_LIMIT`) — matches the "1st vs 8th billed matters" star-power signal from the plan; avoids pulling every background extra
+- **Crew role mapping**: `job == "Director"` → director, `job == "Producer"` → producer, `department == "Writing"` → writer; everything else dropped
+- **`budget_confidence`**: `"estimated"` if TMDb returns a nonzero budget, `"unknown"` if zero/missing — TMDb budgets are crowd-sourced, never treated as `"confirmed"`
+- **Rate limiting**: a small reusable `RateLimiter` (token-spacing, thread-safe) capped at 20 req/sec, well under TMDb's documented ~40 req/sec ceiling — same utility class intended for reuse with YouTube/Reddit later, per the "shared rate-limiter from day one" plan
+
+### Gotcha hit during testing: don't `exec` into the running prefect-worker container
+The long-running `prefect-worker` container already runs the placeholder healthcheck flow, which spins up its own local ephemeral Prefect API server (SQLite-backed) since no Prefect Cloud workspace is wired in yet. Running a second process via `docker compose exec` into that *same* container starts a second local ephemeral server pointing at the same SQLite state file — the two collided mid-migration and crashed the container. Fix: use `docker compose run --rm --no-deps prefect-worker ...` for one-off flow runs, which spins up an independent container with its own throwaway local state. This whole class of problem goes away once Prefect Cloud is actually configured (`PREFECT_API_KEY`/`PREFECT_API_URL` in `.env`) — flows would talk to the shared cloud API instead of each spinning up a local server.
+
+### Verified
+Test run (Q1 2024, `min_vote_count=300`, 59 movies) produced 59 `movies`, 1,207 `people`, 1,308 `movie_credits`, 56 `studios`, 16 `franchises` — genres, MPAA ratings, budget confidence flags, and franchise linking (e.g. *The Beekeeper*, *Justice League: Crisis on Infinite Earths*) all populated correctly.
+
+### Next steps
+- Run the full historical backfill (2010–present, or per the doc's original 15–20 year window)
+- Box Office Mojo scraper for `box_office_totals`/`box_office_weekly` (the prediction label — per the original build order, get this right before feature engineering)
+- OMDb pull for critic scores, in parallel with the above

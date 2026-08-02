@@ -11,7 +11,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- ---------------------------------------------------------------------------
 CREATE TABLE studios (
     id                  SERIAL PRIMARY KEY,
-    name                TEXT NOT NULL UNIQUE,
+    tmdb_company_id     INTEGER UNIQUE,
+    name                TEXT NOT NULL,
     tier                TEXT CHECK (tier IN ('major', 'mini_major', 'indie')),
     historical_avg_roi  NUMERIC
 );
@@ -19,11 +20,14 @@ CREATE TABLE studios (
 -- ---------------------------------------------------------------------------
 -- franchises
 -- Referenced by movies.franchise_id so sequels/reboots can be linked and
--- comps can optionally include/exclude same-franchise entries.
+-- comps can optionally include/exclude same-franchise entries. Maps 1:1 onto
+-- TMDb's belongs_to_collection, dedup'd by tmdb_collection_id (never by
+-- name string, per the same disambiguation rule used for people).
 -- ---------------------------------------------------------------------------
 CREATE TABLE franchises (
-    id      SERIAL PRIMARY KEY,
-    name    TEXT NOT NULL UNIQUE
+    id                  SERIAL PRIMARY KEY,
+    tmdb_collection_id  INTEGER UNIQUE,
+    name                TEXT NOT NULL
 );
 
 -- ---------------------------------------------------------------------------
