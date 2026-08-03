@@ -318,3 +318,40 @@ Full run against the 78 movies already in the DB: 78/78 `box_office_totals` rows
 - Run TMDb + BOM backfill together across the full historical window
 - OMDb pull for critic scores (RT/Metacritic)
 - Revisit The Numbers/Wikipedia as budget cross-checks if `budget_confidence` proves important to the model
+
+---
+
+## Full Historical Backfill (Run)
+
+Ran `tmdb_backfill.py` across 2010-01-01 to 2026-08-03. First attempt at `min_vote_count=200` discovered 7,644 candidates — well above the doc's original 2,000-3,000 target — so raised to `min_vote_count=500`, trading corpus size for staying near the original target and biasing toward well-tracked/higher-hype movies (arguably better signal for a hype-driven model anyway).
+
+### Bug hit and fixed: empty-string `imdb_id` collision
+TMDb returns `imdb_id: ""` (not `null`) for people without a linked IMDb page. `_get_or_create_person` in `tmdb_backfill.py` passed this straight through to `upsert_person`, and since Postgres `UNIQUE` allows multiple `NULL`s but not multiple identical non-null values, the second person with `imdb_id=""` violated `people_imdb_id_key` and crashed the run after ~650 movies. Fixed by normalizing `detail.get("imdb_id") or None`, matching the normalization the movie-level upsert already had.
+
+### Architecture change: dropped `@flow`/`@task` from the backfill scripts
+Both `tmdb_backfill.py` and `bom_backfill.py` originally used Prefect's `@flow`/`@task` decorators. Running them via `docker compose run` repeatedly triggered Prefect's local ephemeral server (used when no real Prefect Cloud workspace is configured) into `database is locked` / startup-timeout crashes — a flakiness in Prefect's own SQLite-backed state, unrelated to our code, that got worse the longer/more request-heavy the run. Since both scripts already have hand-written per-item retry/skip logic (the real safety net), the Prefect orchestration layer added risk without adding value for a one-off manual script. Both are now plain Python — `tmdb_backfill_flow()`/`bom_backfill_flow()` are just regular functions, still callable the same way (`python -m flows.tmdb_backfill ...`). Revisit `@flow`/`@task` once a real Prefect Cloud workspace is wired in (`PREFECT_API_KEY`/`PREFECT_API_URL`), since that removes the local-ephemeral-server failure mode entirely.
+
+### Result
+Corpus grew to 1,291+ movies (2010–2026, `min_vote_count=500`) and climbing — this was run in the background and finished after the API layer work below was already underway.
+
+---
+
+## Movie Data API (Built)
+
+`api/app/routers/movies.py` + `api/app/queries.py` + `api/app/schemas.py` expose the backfilled data via FastAPI, ahead of the actual dashboard frontend. No ORM — raw SQL via SQLAlchemy Core (`text()`), matching the style already used in `prefect-worker/db.py` and the existing `/health` endpoint, rather than introducing SQLAlchemy models.
+
+### Endpoints
+- `GET /movies` — paginated list, filterable by `genre`, `year`, `search` (title `ILIKE`)
+- `GET /movies/{id}` — full detail: core fields, studio, franchise, ordered credits (director → writer → producer → actor, then billing order), box office totals + weekly series
+- `GET /movies/{id}/comps` — heuristic similar-movies list: score = shared genre count + shared-director weight (×3) + shared-actor weight, ranked descending. Explicitly a placeholder for the embedding-based k-NN retrieval from the Modeling Approach section (`movie_embeddings` stays empty until that pipeline exists)
+
+### Verified
+- `GET /movies?limit=3` — real paginated rows against the live (still-growing) corpus
+- `GET /movies/{id}` for *The Beekeeper* — full credits list, correct franchise linking (`The Beekeeper Collection`), box office totals + 11-week series matching the earlier BOM verification
+- `GET /movies/{id}/comps` for *The Beekeeper* — genuinely meaningful results: *End of Watch* (also directed by David Ayer) and *Safe*/*Blitz*/*The Mechanic* (all Jason Statham action-thrillers) ranked at the top, confirming the director/actor-match weighting works as intended
+- 404 confirmed for a nonexistent movie id
+
+### Next steps
+- Frontend dashboard pages against these endpoints (movie list, movie detail "stage timeline" view)
+- Redis caching on the list/detail endpoints once real dashboard traffic patterns exist (deliberately skipped for now — premature at this data volume)
+- OMDb critic score pull, embedding-based comps to eventually replace the heuristic
