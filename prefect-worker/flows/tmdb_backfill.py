@@ -2,19 +2,23 @@
 and movie_credits for wide theatrical releases in a date range.
 
 Run manually (module form, so sibling imports of db.py/tmdb_client.py resolve):
-    docker compose exec prefect-worker python -m flows.tmdb_backfill \
+    docker compose run --rm --no-deps prefect-worker python -m flows.tmdb_backfill \
         --start-date 2010-01-01 --end-date 2026-07-31 --min-vote-count 50
 
 This is a one-time/on-demand backfill, not part of the 60s healthcheck loop
 in worker_entrypoint.py — running it on a schedule would re-hit the same
 movies repeatedly for no benefit (upserts are idempotent, but wasteful).
+
+Deliberately plain Python, not @flow/@task: Prefect's local ephemeral
+server (used when no PREFECT_API_URL/PREFECT_API_KEY is configured) proved
+flaky under `docker compose run` for a long single-shot batch - repeated
+"database is locked" / timeout crashes on its own SQLite-backed state, with
+nothing to do with our code. Retry/skip-on-error logic below is handled by
+hand instead. Revisit once a real Prefect Cloud workspace is wired in.
 """
 
 import argparse
 from datetime import date
-
-from prefect import flow, task
-from prefect.cache_policies import NO_CACHE
 
 from db import (
     get_connection,
@@ -63,7 +67,7 @@ def _get_or_create_person(cur, client: TMDbClient, tmdb_person_id: int, fallback
     detail = client.get_person_detail(tmdb_person_id)
     birth_year = int(detail["birthday"][:4]) if detail.get("birthday") else None
     return upsert_person(
-        cur, tmdb_person_id, detail.get("name") or fallback_name, detail.get("imdb_id"), birth_year
+        cur, tmdb_person_id, detail.get("name") or fallback_name, detail.get("imdb_id") or None, birth_year
     )
 
 
@@ -119,26 +123,20 @@ def process_movie(client: TMDbClient, tmdb_id: int) -> None:
         conn.close()
 
 
-@task(retries=2, retry_delay_seconds=5, cache_policy=NO_CACHE)
-def discover_ids_task(client: TMDbClient, start_date: str, end_date: str, min_vote_count: int) -> list[int]:
-    return list(client.discover_movie_ids(start_date, end_date, min_vote_count))
-
-
-@task(retries=2, retry_delay_seconds=5, cache_policy=NO_CACHE)
-def process_movie_task(client: TMDbClient, tmdb_id: int) -> None:
-    process_movie(client, tmdb_id)
-
-
-@flow(name="tmdb-backfill")
 def tmdb_backfill_flow(start_date: str = "2010-01-01", end_date: str | None = None, min_vote_count: int = 50):
     end_date = end_date or date.today().isoformat()
     client = TMDbClient()
 
-    movie_ids = discover_ids_task(client, start_date, end_date, min_vote_count)
+    movie_ids = list(client.discover_movie_ids(start_date, end_date, min_vote_count))
     print(f"[tmdb-backfill] discovered {len(movie_ids)} candidate movies")
 
     for i, tmdb_id in enumerate(movie_ids, start=1):
-        process_movie_task(client, tmdb_id)
+        try:
+            process_movie(client, tmdb_id)
+        except Exception as exc:
+            # A single bad/unexpected movie payload shouldn't sink a
+            # multi-thousand-movie run - log and move on.
+            print(f"[tmdb-backfill] error processing tmdb_id={tmdb_id}: {exc}")
         if i % 50 == 0:
             print(f"[tmdb-backfill] processed {i}/{len(movie_ids)}")
 

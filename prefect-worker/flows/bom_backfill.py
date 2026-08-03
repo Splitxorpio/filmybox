@@ -9,10 +9,11 @@ No official BOM API exists (scraping, per the planning doc's flagged risk),
 so this stays deliberately slow (1 req/sec, see bom_client.py) and treats a
 missing/unparseable page as a skip, not a fatal error, so one bad movie
 doesn't stop the whole run.
-"""
 
-from prefect import flow, task
-from prefect.cache_policies import NO_CACHE
+Deliberately plain Python, not @flow/@task — see tmdb_backfill.py's
+docstring for why (Prefect's local ephemeral server proved flaky for long
+single-shot batches without a real Prefect Cloud workspace configured).
+"""
 
 import httpx
 
@@ -65,30 +66,19 @@ def process_movie_box_office(client: BOMClient, movie_id: int, imdb_id: str) -> 
     return "ok"
 
 
-@task(cache_policy=NO_CACHE)
-def discover_movies_task() -> list[tuple[int, str]]:
+def bom_backfill_flow():
+    client = BOMClient()
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            return get_movies_missing_box_office(cur)
+            movies = get_movies_missing_box_office(cur)
     finally:
         conn.close()
-
-
-@task(retries=2, retry_delay_seconds=10, cache_policy=NO_CACHE)
-def process_movie_task(client: BOMClient, movie_id: int, imdb_id: str) -> str:
-    return process_movie_box_office(client, movie_id, imdb_id)
-
-
-@flow(name="bom-backfill")
-def bom_backfill_flow():
-    client = BOMClient()
-    movies = discover_movies_task()
     print(f"[bom-backfill] {len(movies)} movies need box office data")
 
     results = {"ok": 0, "not_found": 0}
     for i, (movie_id, imdb_id) in enumerate(movies, start=1):
-        outcome = process_movie_task(client, movie_id, imdb_id)
+        outcome = process_movie_box_office(client, movie_id, imdb_id)
         results[outcome] = results.get(outcome, 0) + 1
         if i % 25 == 0:
             print(f"[bom-backfill] processed {i}/{len(movies)} — {results}")
