@@ -281,3 +281,40 @@ Test run (Q1 2024, `min_vote_count=300`, 59 movies) produced 59 `movies`, 1,207 
 - Run the full historical backfill (2010–present, or per the doc's original 15–20 year window)
 - Box Office Mojo scraper for `box_office_totals`/`box_office_weekly` (the prediction label — per the original build order, get this right before feature engineering)
 - OMDb pull for critic scores, in parallel with the above
+
+---
+
+## Box Office Mojo Scraper (Built)
+
+`prefect-worker/bom_client.py` + `prefect-worker/flows/bom_backfill.py` populate `box_office_totals` and `box_office_weekly` for every movie already in the DB that has an `imdb_id` but no box office data yet. Run manually:
+```
+docker compose run --rm --no-deps prefect-worker python -m flows.bom_backfill
+```
+
+### Reliability research (before building)
+Checked three candidate sources for the box office label data:
+- **Box Office Mojo**: only public source with a true weekend-by-weekend time series (needed for the "legs"/drop-off feature) — nothing else substitutes. No official API; scraping, ToS gray area (already flagged in the original plan). Pages are keyed by `imdb_id` (`/title/{imdb_id}/`), which we already have — clean join, no fuzzy title matching.
+- **The Numbers**: independent second budget figure (caught a real discrepancy: $40M vs. TMDb's $35M for *The Beekeeper*) plus its own weekly table, but keyed by a title+year slug with no stable id — fuzzier join. Deferred.
+- **Wikipedia**: official API, zero scraping risk, but totals/budget only, no weekly series.
+
+Decision: build BOM only for now (the irreplaceable piece); revisit The Numbers as a budget cross-check and Wikipedia as a zero-risk fallback later if budget-confidence turns out to matter a lot for the model.
+
+### How the scraper works
+- `GET /title/{imdb_id}/` → parses the `mojo-performance-summary-table` (domestic/international/worldwide totals, matched by label text, not position) and finds the domestic release's `/release/{id}/` path
+- `GET /release/{id}/weekend/` → parses the weekly table by resolving column `title` attributes (`"Weekend Gross"`, `"Number of Theaters"`, `"Weekend"` = week-in-release number) rather than fixed column positions, so it survives BOM reordering columns
+- `opening_weekend_domestic` is derived from the weekly row where `weekend_number == 1`, not scraped separately
+- Rate limited to 1 req/sec (`RateLimiter`, same reusable class as the TMDb client) — deliberately conservative given the ToS gray area
+- Any per-movie failure (404 = no BOM page, 5xx, timeout) is caught and logged as a skip rather than crashing the whole batch run
+
+### Bugs hit and fixed during testing
+- **Wrong "Domestic" link matched**: the title page has *two* links with the text "Domestic" — a navigation tab (`/date/...`) and the actual release link (`/release/rl.../`). The first match (the nav tab) doesn't fit the release-id pattern, so the naive `find()` silently returned no weekly data for every movie. Fixed by iterating all "Domestic"-text links and taking the one whose `href` actually matches `/release/rl\d+/`.
+- **Duplicate weekend numbers on holiday weekends**: BOM shows two rows tagged with the same week number for holiday frames (e.g. MLK weekend) — a standard 3-day figure and an extended 4-day total. Since our schema is `UNIQUE(movie_id, weekend_number)`, kept the first (standard) row and dropped the duplicate, for comparability across movies that didn't open on a holiday.
+- **One bad page killed the whole batch**: an unhandled 503 on a single movie propagated past Prefect's task retries and crashed the entire flow run after 25/78 movies. Fixed by catching `httpx.HTTPError` per-movie and logging it as a skip, same as the existing 404 handling.
+
+### Verified
+Full run against the 78 movies already in the DB: 78/78 `box_office_totals` rows, 393 `box_office_weekly` rows (avg. ~5 weekends/movie), 43/78 with a populated opening weekend (the rest are movies without a BOM-tracked US domestic release, e.g. day-and-date international titles). Spot-checked *The Beekeeper*'s 11-week legs curve against the live BOM page — exact match.
+
+### Next steps
+- Run TMDb + BOM backfill together across the full historical window
+- OMDb pull for critic scores (RT/Metacritic)
+- Revisit The Numbers/Wikipedia as budget cross-checks if `budget_confidence` proves important to the model
