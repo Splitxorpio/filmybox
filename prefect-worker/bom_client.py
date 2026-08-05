@@ -8,10 +8,11 @@ from rate_limiter import RateLimiter
 
 BOM_BASE_URL = "https://www.boxofficemojo.com"
 
-# No official API here (scraping, per the planning doc's flagged risk) — stay
-# conservative and polite rather than push toward whatever undocumented
-# threshold triggers bot detection.
-_limiter = RateLimiter(max_per_second=1)
+# No official API here (scraping, per the planning doc's flagged risk). Was
+# 1 req/sec, but sustained scraping over several hours started drawing a high
+# 503 rate that a 1-hour cooldown didn't clear - dropped to 1 req/4s as a
+# more conservative pace against whatever undocumented threshold this is.
+_limiter = RateLimiter(max_per_second=0.25)
 
 _HEADERS = {
     "User-Agent": (

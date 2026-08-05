@@ -1,13 +1,16 @@
 import os
 
 import psycopg
+from pgvector.psycopg import register_vector
 
 
 def get_connection() -> psycopg.Connection:
     # DATABASE_URL uses the SQLAlchemy-style "postgresql+psycopg://" dialect
     # prefix; psycopg's native connect wants a plain "postgresql://" DSN.
     dsn = os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://")
-    return psycopg.connect(dsn)
+    conn = psycopg.connect(dsn)
+    register_vector(conn)
+    return conn
 
 
 def upsert_studio(cur, tmdb_company_id: int, name: str) -> int:
@@ -165,4 +168,54 @@ def upsert_box_office_weekly(
             last_updated = now()
         """,
         (movie_id, weekend_number, weekend_gross, theater_count, source),
+    )
+
+
+def get_movies_missing_embeddings(cur) -> list[dict]:
+    cur.execute(
+        """
+        SELECT m.id, m.title, m.release_date, m.genres, m.budget_usd, s.name AS studio_name
+        FROM movies m
+        LEFT JOIN studios s ON s.id = m.studio_id
+        LEFT JOIN movie_embeddings me ON me.movie_id = m.id
+        WHERE me.movie_id IS NULL
+        """
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def get_credits_for_movies(cur, movie_ids: list[int]) -> dict[int, list[dict]]:
+    """movie_id -> ordered list of {name, role_type, billing_order}."""
+    if not movie_ids:
+        return {}
+    cur.execute(
+        """
+        SELECT mc.movie_id, p.name, mc.role_type, mc.billing_order
+        FROM movie_credits mc
+        JOIN people p ON p.id = mc.person_id
+        WHERE mc.movie_id = ANY(%s)
+        ORDER BY mc.movie_id, mc.billing_order NULLS LAST
+        """,
+        (movie_ids,),
+    )
+    by_movie: dict[int, list[dict]] = {}
+    for movie_id, name, role_type, billing_order in cur.fetchall():
+        by_movie.setdefault(movie_id, []).append(
+            {"name": name, "role_type": role_type, "billing_order": billing_order}
+        )
+    return by_movie
+
+
+def upsert_movie_embedding(cur, movie_id: int, embedding: list[float], model_version: str) -> None:
+    cur.execute(
+        """
+        INSERT INTO movie_embeddings (movie_id, embedding, model_version, updated_at)
+        VALUES (%s, %s, %s, now())
+        ON CONFLICT (movie_id) DO UPDATE SET
+            embedding = EXCLUDED.embedding,
+            model_version = EXCLUDED.model_version,
+            updated_at = now()
+        """,
+        (movie_id, embedding, model_version),
     )

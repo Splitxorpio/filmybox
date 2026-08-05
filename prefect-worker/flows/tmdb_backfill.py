@@ -89,7 +89,14 @@ def process_movie(client: TMDbClient, tmdb_id: int) -> None:
                 if collection:
                     franchise_id = upsert_franchise(cur, collection["id"], collection["name"])
 
+                # TMDb sometimes stores clearly-bogus placeholder budgets ($1, $5,
+                # $117...) rather than nulling them - no wide theatrical release
+                # is actually made for under $1k, so treat those as unknown, not
+                # "estimated" (real ultra-low-budget indies like Birdemic's
+                # documented $10k sit safely above this floor).
                 budget = detail.get("budget") or 0
+                if budget < 1000:
+                    budget = 0
                 movie_row = {
                     "tmdb_id": detail["id"],
                     "imdb_id": detail.get("imdb_id") or None,

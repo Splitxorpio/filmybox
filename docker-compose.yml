@@ -44,6 +44,7 @@ services:
     env_file: .env
     volumes:
       - ./prefect-worker:/app
+      - huggingface_cache:/root/.cache/huggingface
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,3 +65,4 @@ services:
 
 volumes:
   postgres_data:
+  huggingface_cache:

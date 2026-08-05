@@ -355,3 +355,103 @@ Corpus grew to 1,291+ movies (2010–2026, `min_vote_count=500`) and climbing �
 - Frontend dashboard pages against these endpoints (movie list, movie detail "stage timeline" view)
 - Redis caching on the list/detail endpoints once real dashboard traffic patterns exist (deliberately skipped for now — premature at this data volume)
 - OMDb critic score pull, embedding-based comps to eventually replace the heuristic
+
+---
+
+## Full Backfill Completion, Data Audit, and Embedding Pipeline
+
+Once the full TMDb backfill finished (4,395 movies, 45,059 people, 94,803 credits, 1,921 studios, 644 franchises, zero errors) and BOM was kicked off against the complete set, used the wait time productively: data quality audit → comps heuristic stress test at scale → embedding pipeline.
+
+### Data quality audit
+Coverage across the full corpus: 99.98% have `imdb_id`, 99.75% have a studio, 88% have an MPAA rating, 0 missing genres/runtime. Budget: 67.7% `estimated`, 32.3% `unknown` (close to the doc's expected 20-30%).
+
+**Real bug found**: TMDb sometimes stores clearly-bogus placeholder budgets (`$1`, `$5`, `$7`, `$117`, `$119`) instead of nulling them when the real budget is unknown — 6 movies had this. Since our `budget_confidence` logic only checked `budget > 0`, these were being marked `"estimated"` rather than `"unknown"`, which would badly corrupt any ROI-multiplier feature (dividing box office by a "$1 budget"). Confirmed a $1,000 floor cleanly separates the garbage from genuine ultra-low-budget films (*Birdemic: Shock and Terror*'s well-documented real $10,000 budget sits safely above it). Fixed both the 6 existing rows (`budget_usd = NULL`, `budget_confidence = 'unknown'`) and the bug at its source in `tmdb_backfill.py` (`process_movie`) so future backfills don't reintroduce it.
+
+### Comps heuristic stress test (at 4,395 movies vs. the original 78)
+Spot-checked across genres/eras/franchises — held up very well: correctly surfaced franchise sequences (*Fast X* → *F9*/*Furious 7*/*Fast Five*, *Toy Story 4* → *Toy Story 5*) and, more impressively, auteur directors purely via the director-match weight rather than genre alone (*Inception* → *Interstellar*/*Tenet*/*Dunkirk*, *La La Land* → *Whiplash*/*Babylon*, *Get Out* → *Nope*/*Us*, *The Conjuring* → *Insidious* 1&2). No failures worth fixing.
+
+### Embedding pipeline (Built)
+`prefect-worker/embedding_client.py` (lazy-loaded `sentence-transformers/all-MiniLM-L6-v2` singleton) + `prefect-worker/flows/build_embeddings.py` populate `movie_embeddings` — the learned-embedding-space step from the Modeling Approach section, intended to eventually replace/supplement the heuristic `/comps` endpoint. Text descriptor per movie: genres, director(s), top-5-billed cast, studio, coarse budget tier, release year — deliberately **not including the movie title** (see bug below). Added `pgvector` (Python package) for clean vector parameter binding via `register_vector(conn)`, and a named Docker volume for the HuggingFace model cache so repeated one-off runs don't re-download the ~80MB model weights.
+
+**Dependency tradeoff accepted**: `sentence-transformers` pulls in `torch`, growing the `prefect-worker` image by roughly 1-2GB and adding several minutes to builds. Confined to this one ETL-only container, consistent with the existing service-boundary rationale (scraping/ML batch jobs isolated from the request-serving API).
+
+#### Bugs hit and fixed
+- **psycopg3 `with conn:` closes the connection, not just the transaction** (a real difference from psycopg2): `build_embeddings.py` reused one connection across all batches, and the first batch's `with conn: ...` block committed *and closed* the connection, crashing the second batch with `the connection is closed`. Fixed by using `conn.commit()` explicitly instead of the `with conn:` context manager when a connection needs to survive past the current block.
+- **Movie title in the embedded text caused superficial lexical clustering, not semantic similarity**: initial results were bad — *The Beekeeper*'s top match was *Ramona and Beezus* (a kids' comedy), *Fast X*'s top matches were "X" and "Saw X", *Get Out*'s were *Inside Out*/*Lights Out*. All wordpiece/subword token overlap on the title, drowning out the structured genre/cast/director signal. Fixed by dropping the title from the embedded text entirely — result was a dramatic quality jump (cosine distances tightened from ~0.3-0.44 down to ~0.11-0.16) and the nearest neighbors became genuinely coherent: *Fast X* → *F9* (correct franchise entry, now #1), *Inception* → *Interstellar*/*TRON: Legacy*/*Mad Max: Fury Road* (big-budget sci-fi/action spectacle), *Get Out* → *It Comes at Night*/*It Follows* (genuinely similar low-budget horror-thriller).
+- Re-indexed `idx_movie_embeddings_ivfflat` after the bulk load (it was created against an empty table originally, which `ivfflat` clusters poorly against).
+
+**Note on the two similarity approaches**: the embedding surfaces a different, complementary notion of similarity to the heuristic — broader genre/style/budget-tier clustering rather than the heuristic's exact-match director/cast rewards. Both are valid; this was expected, not a discrepancy to resolve.
+
+### Verified
+4,395/4,395 movies embedded. k-NN sanity-checked via raw `<=>` cosine-distance SQL against *The Beekeeper*, *Inception*, *Fast X*, *Get Out* — all produced thematically coherent nearest neighbors after the title fix.
+
+### Next steps
+- Wire `GET /movies/{id}/comps` to optionally use pgvector k-NN (`ORDER BY embedding <=> ...`) alongside or instead of the heuristic
+- Re-run `build_embeddings.py` once BOM data lands, to consider folding box office performance into the text descriptor (currently pre-release signals only)
+- OMDb critic score pull
+
+---
+
+## Embedding Model Migration: MiniLM → nomic-embed-text-v1.5
+
+Decided to migrate ahead of the originally-planned review-embedding work (see next section), on the reasoning that MiniLM's 256-token context would badly truncate real reviews (400-1000+ words), making the switch immediately relevant rather than a future concern.
+
+### Model comparison (researched before switching)
+Compared three candidates — `all-MiniLM-L6-v2` (current), `nomic-embed-text-v1.5`, and `embeddinggemma:300m`:
+
+| | MiniLM (previous) | nomic-embed-text-v1.5 | embeddinggemma:300m |
+|---|---|---|---|
+| Params | 22.7M | 137M | 300M |
+| Native dims | 384 | 768, Matryoshka to 64 | 768, Matryoshka to 128 |
+| Context | 256 tokens | 8,192 tokens | 2,048 tokens |
+| MTEB | not top-tier (2021 baseline) | ~62.28 | 69.67 (English v2) |
+| Languages | English | English | 100+ |
+
+Chose nomic over Gemma: Gemma's higher MTEB score comes with multilingual support we don't need, and its Matryoshka breakpoints (768/512/256/128) don't include 384, forcing a schema migration regardless. Nomic's Matryoshka range goes down to 64, so it can truncate to exactly 384 — a drop-in replacement for the existing `movie_embeddings.embedding VECTOR(384)` column with no schema change.
+
+### Implementation details
+- `prefect-worker/embedding_client.py`: switched to `nomic-ai/nomic-embed-text-v1.5` via `sentence-transformers` (`trust_remote_code=True`, required until transformers v5.5.0/sentence-transformers v5.3.0). Every input gets nomic's required task-instruction prefix — used `"clustering: "` (matches our use case: grouping similar movies), not `"search_query"/"search_document"` (those are for query-vs-document retrieval).
+- Matryoshka truncation to 384 follows nomic's documented recipe: layer-norm the full 768-dim output, slice to 384, re-normalize (`F.layer_norm` → slice → `F.normalize`).
+- `model_version` now stores `"nomic-ai/nomic-embed-text-v1.5@384d"` (base model + truncation width together, since they jointly determine the vector space — a future switch to a different truncation width needs its own re-embed, and this makes that visible in the data itself).
+- Added `einops` to `requirements.txt` (required by nomic's custom model code).
+
+### Bug hit and fixed: CPU-only torch
+Rebuilding after adding `einops` triggered a fresh, unpinned `torch` resolution that pulled the **GPU/CUDA build** — several GB of `nvidia-cudnn`/`nvidia-cublas`/`triton`/etc. wheels, completely unused since this container only ever runs on CPU. Fixed in `prefect-worker/Dockerfile` by installing a pinned CPU-only wheel first (`pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu`) before the general `requirements.txt` install, so pip's dependency resolver sees torch already satisfied and never reaches for the CUDA build. Cut the torch download from 526MB (+ ~1.5GB of CUDA packages) down to 174.6MB; final image settled at 2.2GB instead of an unbounded larger size.
+
+### Verified: same stress-test movies as MiniLM, head-to-head
+Re-ran identical k-NN sanity checks (*The Beekeeper*, *Inception*, *Fast X*, *Get Out*) against the same queries used for MiniLM. Nomic won decisively on every one:
+
+| Movie | MiniLM top result | Nomic top result |
+|---|---|---|
+| *The Beekeeper* | *Ramona and Beezus* (before title-fix bug) / general action-thriller cluster (after) | **A Working Man** — Statham's *next* film with David Ayer, the best possible match |
+| *Inception* | *Interstellar* at #3 | *Dark Knight Rises*, *Tenet*, *Interstellar* — 3 of 6 are Nolan's own films |
+| *Fast X* | *F9* at distance 0.127 | *F9* at distance **0.046** — much tighter |
+| *Get Out* | Neither *Us* nor *Nope* appeared in top 6 | **Us** and **Nope** rank #1 and #2 |
+
+Cosine distances also tightened across the board (MiniLM ~0.11-0.16 → nomic ~0.05-0.10), indicating more confident, decisive clustering, not just better top-1 picks.
+
+### Next steps
+- Review-embedding pipeline (the original motivation for this migration) — new `review_embeddings` table, source TBD, using nomic at full native 768-dim rather than the 384-truncated version used for `movie_embeddings`
+- Wire pgvector k-NN into `GET /movies/{id}/comps`, now with a meaningfully stronger embedding backing it
+
+---
+
+## BOM Backfill Completion (Full Corpus)
+
+The full-corpus BOM run (started before the embedding migration, interleaved with it across several sessions) hit a real-world scraping reliability issue worth recording in detail, since the fix mattered.
+
+### The 503 problem
+After roughly an hour of sustained scraping at the original 1 req/sec rate, Box Office Mojo's error rate climbed sharply — from a normal few percent up to 45%, then 77%, then 73% on immediate back-to-back retries, even after a full 1-hour cooldown between attempts. Box Office Mojo has no official API or published rate limit (unlike TMDb's documented ~40 req/sec), so there was no stated threshold to target — the 503s were the only signal available, and they pointed to an undocumented, IP-level soft-block triggered by sustained request volume rather than a transient server issue (a real API rate-limit violation typically returns 429, not 503; a 503 from a struggling-but-not-actively-blocking server was the working hypothesis until behavior proved otherwise).
+
+**Fix**: dropped `bom_client.py`'s self-imposed rate limit from 1 req/sec to 1 req/4sec (`RateLimiter(max_per_second=0.25)`). This fully resolved it — the final run against the last 826 movies completed with **zero errors**, versus the 45-77% error rates seen at the faster pace.
+
+### Operational note: mid-run Docker Desktop restart
+Partway through, the whole Docker Desktop daemon stopped (likely a system restart), silently killing the in-progress scraping container. No data was lost — Postgres's volume persisted independently, and the backfill's `LEFT JOIN ... WHERE box_office_totals.movie_id IS NULL` discovery query meant simply re-running `bom_backfill.py` picked up exactly where it left off, no manual bookkeeping needed. This is the same idempotency property that made the earlier 503-driven retries safe to just re-run rather than needing careful resumption logic.
+
+### Final result
+**4,394/4,394 movies have box office data. 0 missing. 23,131 `box_office_weekly` rows** (~5.3 weekends/movie average, consistent with typical theatrical runs). Combined with the full TMDb backbone (4,395 movies, 45,059 people, 94,803 credits) and the nomic-based `movie_embeddings` for all 4,395 movies, the full historical dataset described in the original plan's Step 2/3 scope is now completely populated.
+
+### Next steps
+- Feature engineering / staged model training can now begin in earnest — this was the "cold start problem... likely the biggest time sink" the original plan flagged, and it's done
+- OMDb critic score pull (the remaining un-backfilled source from the original Step 4 build order)
+- Reddit sentiment pull (lowest priority per the original plan, most fragile source)
