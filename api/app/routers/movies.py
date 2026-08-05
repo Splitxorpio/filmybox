@@ -1,10 +1,15 @@
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.engine import Connection
 
 from app import queries
+from app.config import settings
 from app.db import get_db
+from app.omdb_client import OMDbRateLimited, fetch_critic_scores
 from app.schemas import (
     CompOut,
+    CriticScoresOut,
     FranchiseOut,
     MovieDetail,
     MovieListResponse,
@@ -41,6 +46,30 @@ def list_movies(
     return MovieListResponse(total=total, limit=limit, offset=offset, items=items)
 
 
+def _get_or_fetch_critic_scores(conn: Connection, movie_id: int, imdb_id: str | None) -> CriticScoresOut | None:
+    cached = queries.get_critic_scores(conn, movie_id)
+    if cached is not None:
+        return CriticScoresOut(**cached)
+
+    if not settings.omdb_api_key or not imdb_id:
+        return None
+
+    try:
+        scores = fetch_critic_scores(imdb_id, settings.omdb_api_key)
+    except OMDbRateLimited:
+        return None
+    except Exception:
+        # Network hiccup, malformed response, etc. - the rest of the movie
+        # detail response must still succeed regardless.
+        return None
+
+    if scores is None:
+        return None
+
+    queries.upsert_critic_scores(conn, movie_id, scores)
+    return CriticScoresOut(**scores)
+
+
 @router.get("/{movie_id}", response_model=MovieDetail)
 def get_movie(movie_id: int, conn: Connection = Depends(get_db)):
     movie = queries.get_movie(conn, movie_id)
@@ -49,6 +78,7 @@ def get_movie(movie_id: int, conn: Connection = Depends(get_db)):
 
     credits = queries.get_movie_credits(conn, movie_id)
     totals, weekly = queries.get_box_office(conn, movie_id)
+    critic_scores = _get_or_fetch_critic_scores(conn, movie_id, movie["imdb_id"])
 
     return MovieDetail(
         id=movie["id"],
@@ -67,11 +97,19 @@ def get_movie(movie_id: int, conn: Connection = Depends(get_db)):
         credits=credits,
         box_office_totals=totals,
         box_office_weekly=weekly,
+        critic_scores=critic_scores,
     )
 
 
 @router.get("/{movie_id}/comps", response_model=list[CompOut])
-def get_comps(movie_id: int, limit: int = Query(10, ge=1, le=50), conn: Connection = Depends(get_db)):
+def get_comps(
+    movie_id: int,
+    limit: int = Query(10, ge=1, le=50),
+    method: Literal["embedding", "heuristic"] = "embedding",
+    conn: Connection = Depends(get_db),
+):
     if queries.get_movie(conn, movie_id) is None:
         raise HTTPException(status_code=404, detail="Movie not found")
+    if method == "embedding":
+        return queries.get_comps_by_embedding(conn, movie_id, limit)
     return queries.get_comps(conn, movie_id, limit)

@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://filmybox:filmybox@postgres:5432/filmybox"
     redis_url: str = "redis://redis:6379/0"
+    omdb_api_key: str = ""
 
     class Config:
         env_file = ".env"

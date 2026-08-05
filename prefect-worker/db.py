@@ -219,3 +219,70 @@ def upsert_movie_embedding(cur, movie_id: int, embedding: list[float], model_ver
         """,
         (movie_id, embedding, model_version),
     )
+
+
+def get_movies_missing_critic_scores(cur, limit: int) -> list[tuple[int, str]]:
+    """(movie_id, imdb_id), most recently released first - prioritizes
+    movies most likely to be viewed soon on the dashboard.
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.imdb_id
+        FROM movies m
+        LEFT JOIN critic_scores cs ON cs.movie_id = m.id
+        WHERE m.imdb_id IS NOT NULL AND cs.movie_id IS NULL
+        ORDER BY m.release_date DESC NULLS LAST
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return cur.fetchall()
+
+
+def upsert_critic_scores(cur, movie_id: int, scores: dict) -> None:
+    cur.execute(
+        """
+        INSERT INTO critic_scores (movie_id, imdb_rating, imdb_votes, rotten_tomatoes_pct, metacritic_score)
+        VALUES (%(movie_id)s, %(imdb_rating)s, %(imdb_votes)s, %(rotten_tomatoes_pct)s, %(metacritic_score)s)
+        ON CONFLICT (movie_id) DO UPDATE SET
+            imdb_rating = EXCLUDED.imdb_rating,
+            imdb_votes = EXCLUDED.imdb_votes,
+            rotten_tomatoes_pct = EXCLUDED.rotten_tomatoes_pct,
+            metacritic_score = EXCLUDED.metacritic_score,
+            fetched_at = now()
+        """,
+        {"movie_id": movie_id, **scores},
+    )
+
+
+def get_recent_movies(cur, days: int = 90) -> list[tuple[int, int, str]]:
+    """(movie_id, tmdb_id, imdb_id) for movies released within the last N
+    days (or in the future - upcoming releases included). Older movies'
+    RT/Metacritic gaps are inherent to OMDb's own data (confirmed by direct
+    spot-check), not something a refresh fixes, so this stays narrow.
+    """
+    cur.execute(
+        """
+        SELECT id, tmdb_id, imdb_id
+        FROM movies
+        WHERE release_date >= CURRENT_DATE - make_interval(days => %s)
+          AND tmdb_id IS NOT NULL AND imdb_id IS NOT NULL
+        ORDER BY release_date DESC
+        """,
+        (days,),
+    )
+    return cur.fetchall()
+
+
+def ensure_critic_scores_row(cur, movie_id: int) -> None:
+    cur.execute(
+        "INSERT INTO critic_scores (movie_id) VALUES (%s) ON CONFLICT (movie_id) DO NOTHING",
+        (movie_id,),
+    )
+
+
+def update_tmdb_votes(cur, movie_id: int, vote_average: float | None, vote_count: int | None) -> None:
+    cur.execute(
+        "UPDATE critic_scores SET tmdb_vote_average = %s, tmdb_vote_count = %s WHERE movie_id = %s",
+        (vote_average, vote_count, movie_id),
+    )

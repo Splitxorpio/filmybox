@@ -34,6 +34,15 @@ class BoxOfficeWeeklyOut(BaseModel):
     theater_count: int | None
 
 
+class CriticScoresOut(BaseModel):
+    imdb_rating: float | None
+    imdb_votes: int | None
+    rotten_tomatoes_pct: int | None
+    metacritic_score: int | None
+    tmdb_vote_average: float | None = None
+    tmdb_vote_count: int | None = None
+
+
 class MovieSummary(BaseModel):
     id: int
     title: str
@@ -67,11 +76,13 @@ class MovieDetail(BaseModel):
     credits: list[CreditOut]
     box_office_totals: BoxOfficeTotalsOut | None
     box_office_weekly: list[BoxOfficeWeeklyOut]
+    critic_scores: CriticScoresOut | None
 
 
 class CompOut(BaseModel):
     movie_id: int
     title: str
     release_date: date | None
-    shared_genres: list[str]
-    score: int
+    shared_genres: list[str] = []
+    score: int | None = None
+    distance: float | None = None

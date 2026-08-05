@@ -455,3 +455,76 @@ Partway through, the whole Docker Desktop daemon stopped (likely a system restar
 - Feature engineering / staged model training can now begin in earnest — this was the "cold start problem... likely the biggest time sink" the original plan flagged, and it's done
 - OMDb critic score pull (the remaining un-backfilled source from the original Step 4 build order)
 - Reddit sentiment pull (lowest priority per the original plan, most fragile source)
+
+---
+
+## OMDb Critic Scores: On-Demand + Background Trickle (Built)
+
+OMDb's free tier caps at **1,000 requests/day** with no way through it in one sitting — a bulk backfill of all 4,394 movies (like TMDb/BOM got) would take 5+ days. Rather than force that pattern, built a hybrid: fetch-and-cache on demand for whatever's actually being viewed, plus a slow background trickle that opportunistically fills in the rest under the daily cap.
+
+### Schema
+New `critic_scores` table (`db/init/003_critic_scores.sql`, applied live): `movie_id` (PK), `imdb_rating`, `imdb_votes`, `rotten_tomatoes_pct`, `metacritic_score`, `source`, `fetched_at`. Row presence = "fetched, don't refetch" for v1 — no staleness/refresh policy yet.
+
+### On-demand path (`api/`)
+`GET /movies/{id}` (`api/app/routers/movies.py`) now checks `critic_scores` first; on a cache miss, calls OMDb synchronously via the new `api/app/omdb_client.py`, caches the result, returns it inline. Added `httpx` to `api/requirements.txt` (not previously a dependency there) and `omdb_api_key` to `Settings`. Designed to degrade gracefully at every failure point — missing key, OMDb's daily-limit response, or any other exception all just return `critic_scores: null` rather than failing the whole movie detail request.
+
+### Background trickle (`prefect-worker/`)
+`prefect-worker/flows/omdb_trickle.py` — plain Python (same established pattern, no `@flow`/`@task`), processes up to `MAX_PER_RUN = 900` movies per run (headroom under the 1,000 cap for on-demand traffic), ordered by `release_date DESC NULLS LAST` so recently-released movies (most likely to be viewed soon) get filled in first. Stops immediately and reports clearly if OMDb signals its daily limit rather than continuing to burn calls on guaranteed failures. Meant to run once/day manually for now; a real schedule is a Prefect Cloud concern once that's configured.
+
+### Duplication note
+The OMDb client + parsing logic is intentionally duplicated between `api/` and `prefect-worker/` rather than shared — matches the existing architecture, where these two services already have zero shared code (even different DB access styles: SQLAlchemy Core vs. raw psycopg).
+
+### Bug caught during verification (not a code bug — a key activation issue)
+First live test returned `401 Unauthorized` from OMDb. Diagnosed by calling `omdb_client.fetch_critic_scores` directly inside the `api` container (bypassing the router's broad exception handler, which was silently swallowing the real error — worth knowing that handler intentionally hides errors from the response, so direct-client testing is the way to debug it). Turned out to be OMDb's email verification step not yet completed on the new key; worked immediately once activated.
+
+### Verified end-to-end
+- No key set → `critic_scores: null`, rest of movie detail still returns correctly
+- Real key, cache miss → live OMDb fetch, correct parsing (*The Beekeeper*: IMDb 6.3, RT 71%, Metacritic 53), cached to `critic_scores`
+- Repeat request → served from cache, confirmed via unchanged `fetched_at` (no second OMDb call)
+- Trickle flow (capped at 5 for testing) → correctly prioritized the most recently released movies, handled movies missing specific scores (e.g. no RT % yet) gracefully
+
+### Next steps
+- Run the trickle flow daily (or once real Prefect Cloud scheduling is set up) until the historical corpus is fully covered
+- Reddit sentiment pull (lowest priority per the original plan, most fragile source)
+
+---
+
+## Critic-Score Gap Investigation + Recent-Movie Refresh (Built)
+
+After the first full trickle run (900 movies), some had missing Rotten Tomatoes (128) or Metacritic (106) scores. Investigated and addressed in four parts.
+
+### #1/#2: Spot-check confirmed genuine OMDb-side gaps, not a bug
+Called `omdb_client.fetch_critic_scores` directly against the raw OMDb API for *Talk to Me* (a well-reviewed 2023 horror film) — OMDb's own `Ratings` array only contained IMDb and Metacritic entries, no Rotten Tomatoes at all, despite the film certainly having a real RT score in the world. This confirmed the gaps are inherent to OMDb's own data completeness, not a parsing bug on our end, and not fixable without going directly to RT (which OMDb was chosen specifically to avoid). Decision: treat missingness as real signal (a movie some critics never scored/aggregated), not an error to chase — no code change, just documented as v1's stance. Side note: OMDb's raw response also includes a `BoxOffice` field (domestic gross) — redundant with our BOM data, not used.
+
+### #3/#4: `prefect-worker/flows/refresh_recent.py` (new), scoped to recent movies only
+Explicitly limited to `release_date >= CURRENT_DATE - 90 days` (includes upcoming/unreleased movies too, since those are trivially within the window) — older movies' gaps are permanent per the investigation above, so refreshing them has no payoff; per the original ask, "not worth the investment for older movies."
+
+- **#3 (TMDb audience votes)**: added `tmdb_vote_average`/`tmdb_vote_count` columns to `critic_scores` — a supplementary audience-sentiment signal, not a critic score. Wasn't new data to fetch: `TMDbClient.get_movie_detail()` already returns these fields on every call; the original `tmdb_backfill.py` simply never persisted them. Reused the existing client method as-is rather than adding a slimmer one for two fields, since the recent-movies subset is small enough that the extra unused credits/release_dates payload is a negligible cost.
+- **#4 (OMDb re-check)**: re-fetches OMDb for the same recent-movies subset, in case a movie was originally scored before its reviews caught up (embargo/early access). Reuses the existing `upsert_critic_scores` (`ON CONFLICT DO UPDATE`) — no new upsert logic needed.
+
+New `db.py` helpers: `get_recent_movies`, `ensure_critic_scores_row` (`INSERT ... ON CONFLICT DO NOTHING`, so a movie with no OMDb data yet still gets a row for the TMDb-only fields), `update_tmdb_votes`.
+
+Exposed via API: `CriticScoresOut` gained `tmdb_vote_average`/`tmdb_vote_count` (both defaulted to `None` — required to avoid breaking the on-demand path in `routers/movies.py`, which constructs `CriticScoresOut` from an OMDb-only dict that never has these two keys).
+
+### Verified
+18 movies fell in the 90-day window. All 18 got TMDb vote data populated — including *Avatar Aang: The Last Airbender*, which has zero OMDb data yet but got real TMDb votes (9.318 avg / 655 votes), exactly the gap-filling case this was built for. OMDb re-check ran cleanly alongside it, correctly leaving fields null where OMDb genuinely has nothing (consistent with the earlier finding — most of these are permanent gaps, not timing issues). Confirmed via `GET /movies/{id}` that both new fields surface correctly in the API response (*Toy Story 5*: `tmdb_vote_average: 7.413, tmdb_vote_count: 756` alongside its OMDb scores).
+
+### Next steps
+- Run `refresh_recent.py` periodically (e.g. weekly) alongside the daily `omdb_trickle.py`
+- Reddit sentiment pull (lowest priority per the original plan, most fragile source)
+
+---
+
+## pgvector k-NN Wired into `/comps` (Built)
+
+`GET /movies/{id}/comps` now supports both similarity methods via a `method` query param (`embedding` default, `heuristic` available too) rather than only the hand-written heuristic. `api/app/queries.py:get_comps_by_embedding` runs the same `<=>` cosine-distance query used to manually validate the nomic embeddings earlier, unparameterized on the Python side (no `pgvector` package needed in `api/` — that's only required where Python vectors get inserted, in `prefect-worker`).
+
+`CompOut` extended with `distance: float | None` and `shared_genres`/`score` made optional (defaulted), since the two methods return different fields — embedding mode leaves `shared_genres`/`score` empty/null, heuristic mode leaves `distance` null.
+
+### Verified
+Both modes tested against *Get Out*: embedding mode returns *Us*/*Nope* at #1/#2 (distances 0.057/0.063, matching earlier manual verification exactly); heuristic mode also surfaces *Nope*/*Us* but via genre-overlap scoring instead. 404 still correctly returned for a nonexistent movie id.
+
+### Next steps
+- Feature engineering / staged GBT model pipeline — the actual core product feature (stage-by-stage verdict + confidence interval), not yet started; everything through this point has been the data layer
+- Trailer/YouTube and Reddit sentiment ingestion
+- Redis caching, automated tests, real Prefect Cloud scheduling

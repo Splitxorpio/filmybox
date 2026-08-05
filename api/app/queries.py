@@ -56,7 +56,7 @@ def get_movie(conn: Connection, movie_id: int) -> dict | None:
     row = conn.execute(
         text(
             """
-            SELECT m.id, m.title, m.release_date, m.genres, m.runtime_minutes, m.mpaa_rating,
+            SELECT m.id, m.imdb_id, m.title, m.release_date, m.genres, m.runtime_minutes, m.mpaa_rating,
                    m.original_language, m.budget_usd, m.budget_confidence,
                    s.id AS studio_id, s.name AS studio_name,
                    f.id AS franchise_id, f.name AS franchise_name
@@ -124,9 +124,9 @@ def get_box_office(conn: Connection, movie_id: int) -> tuple[dict | None, list[d
 def get_comps(conn: Connection, movie_id: int, limit: int) -> list[dict]:
     """Heuristic comps: shared genres + shared director/cast, weighted and ranked.
 
-    Placeholder for the embedding-based k-NN retrieval described in the
-    Modeling Approach section of the planning doc (movie_embeddings table
-    exists but is empty until that pipeline is built).
+    Rewards exact-match signals (same director/actor) that the embedding-based
+    get_comps_by_embedding won't necessarily surface - the two are
+    complementary, not redundant (see planning doc).
     """
     rows = conn.execute(
         text(
@@ -169,3 +169,62 @@ def get_comps(conn: Connection, movie_id: int, limit: int) -> list[dict]:
         {"movie_id": movie_id, "limit": limit},
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+def get_comps_by_embedding(conn: Connection, movie_id: int, limit: int) -> list[dict]:
+    """Embedding-based comps via pgvector cosine distance (nomic-embed-text-v1.5,
+    see prefect-worker/flows/build_embeddings.py). Surfaces broader style/tone
+    similarity the heuristic's exact-match scoring can miss - e.g. Get Out's
+    top embedding matches are other low-budget elevated-horror films, not just
+    Jordan Peele's own movies specifically.
+    """
+    rows = conn.execute(
+        text(
+            """
+            SELECT m.id AS movie_id, m.title, m.release_date,
+                   (me2.embedding <=> me1.embedding) AS distance
+            FROM movie_embeddings me1
+            JOIN movie_embeddings me2 ON me2.movie_id != me1.movie_id
+            JOIN movies m ON m.id = me2.movie_id
+            WHERE me1.movie_id = :movie_id
+            ORDER BY distance ASC
+            LIMIT :limit
+            """
+        ),
+        {"movie_id": movie_id, "limit": limit},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def get_critic_scores(conn: Connection, movie_id: int) -> dict | None:
+    row = conn.execute(
+        text(
+            """
+            SELECT imdb_rating, imdb_votes, rotten_tomatoes_pct, metacritic_score,
+                   tmdb_vote_average, tmdb_vote_count
+            FROM critic_scores
+            WHERE movie_id = :movie_id
+            """
+        ),
+        {"movie_id": movie_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def upsert_critic_scores(conn: Connection, movie_id: int, scores: dict) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT INTO critic_scores (movie_id, imdb_rating, imdb_votes, rotten_tomatoes_pct, metacritic_score)
+            VALUES (:movie_id, :imdb_rating, :imdb_votes, :rotten_tomatoes_pct, :metacritic_score)
+            ON CONFLICT (movie_id) DO UPDATE SET
+                imdb_rating = EXCLUDED.imdb_rating,
+                imdb_votes = EXCLUDED.imdb_votes,
+                rotten_tomatoes_pct = EXCLUDED.rotten_tomatoes_pct,
+                metacritic_score = EXCLUDED.metacritic_score,
+                fetched_at = now()
+            """
+        ),
+        {"movie_id": movie_id, **scores},
+    )
+    conn.commit()
