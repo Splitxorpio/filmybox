@@ -286,3 +286,126 @@ def update_tmdb_votes(cur, movie_id: int, vote_average: float | None, vote_count
         "UPDATE critic_scores SET tmdb_vote_average = %s, tmdb_vote_count = %s WHERE movie_id = %s",
         (vote_average, vote_count, movie_id),
     )
+
+
+_STAGE_RANK_SQL = """
+    CASE stage
+        WHEN 'post_release' THEN 5
+        WHEN 'pre_release' THEN 4
+        WHEN 'trailer' THEN 3
+        WHEN 'teaser' THEN 2
+        WHEN 'announcement' THEN 1
+    END
+"""
+
+
+def get_movies_needing_stage_check(cur) -> list[tuple[int, int, str, object, object]]:
+    """(movie_id, tmdb_id, imdb_id, release_date, budget_usd) for movies with
+    no verdict yet, or whose furthest-reached stage isn't post_release yet.
+    Doubles as both the one-time historical backfill (first run) and the
+    ongoing daily incremental scan, since almost all historical movies land
+    straight in post_release and are never revisited after that.
+    """
+    cur.execute(
+        f"""
+        SELECT m.id, m.tmdb_id, m.imdb_id, m.release_date, m.budget_usd
+        FROM movies m
+        LEFT JOIN LATERAL (
+            SELECT stage FROM verdicts v WHERE v.movie_id = m.id
+            ORDER BY {_STAGE_RANK_SQL} DESC LIMIT 1
+        ) latest ON true
+        WHERE latest.stage IS NULL OR latest.stage != 'post_release'
+        """
+    )
+    return cur.fetchall()
+
+
+def get_trailers_for_movie(cur, movie_id: int) -> list[dict]:
+    cur.execute(
+        "SELECT id, external_id, trailer_type, publish_date FROM trailers WHERE movie_id = %s",
+        (movie_id,),
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def insert_trailer(
+    cur,
+    movie_id: int,
+    external_id: str,
+    url: str,
+    trailer_type: str,
+    publish_date,
+) -> int:
+    cur.execute(
+        """
+        INSERT INTO trailers (movie_id, platform, external_id, url, trailer_type, publish_date)
+        VALUES (%s, 'youtube', %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (movie_id, external_id, url, trailer_type, publish_date),
+    )
+    return cur.fetchone()[0]
+
+
+def upsert_trailer_metrics(cur, trailer_id: int, snapshot_date, stats: dict) -> None:
+    cur.execute(
+        """
+        INSERT INTO trailer_metrics (trailer_id, snapshot_date, view_count, like_count, comment_count)
+        VALUES (%(trailer_id)s, %(snapshot_date)s, %(view_count)s, %(like_count)s, %(comment_count)s)
+        ON CONFLICT (trailer_id, snapshot_date) DO UPDATE SET
+            view_count = EXCLUDED.view_count,
+            like_count = EXCLUDED.like_count,
+            comment_count = EXCLUDED.comment_count
+        """,
+        {"trailer_id": trailer_id, "snapshot_date": snapshot_date, **stats},
+    )
+
+
+def get_comps_for_verdict(cur, movie_id: int, limit: int) -> list[tuple[int, object, object]]:
+    """(comp_movie_id, budget_usd, total_worldwide) for the top-k embedding
+    comps, same <=> cosine-distance query as api/app/queries.py's
+    get_comps_by_embedding - duplicated per the established cross-service
+    pattern (api/ and prefect-worker/ already share no code).
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.budget_usd, bot.total_worldwide
+        FROM movie_embeddings me1
+        JOIN movie_embeddings me2 ON me2.movie_id != me1.movie_id
+        JOIN movies m ON m.id = me2.movie_id
+        LEFT JOIN box_office_totals bot ON bot.movie_id = m.id
+        WHERE me1.movie_id = %s
+        ORDER BY (me2.embedding <=> me1.embedding) ASC
+        LIMIT %s
+        """,
+        (movie_id, limit),
+    )
+    return cur.fetchall()
+
+
+def upsert_verdict(cur, movie_id: int, stage: str, verdict: dict) -> None:
+    cur.execute(
+        """
+        INSERT INTO verdicts (
+            movie_id, stage, comp_count, roi_multiple_p25, roi_multiple_p50, roi_multiple_p75,
+            verdict_bucket, comp_movie_ids, actual_roi_multiple, actual_bucket
+        )
+        VALUES (
+            %(movie_id)s, %(stage)s, %(comp_count)s, %(roi_multiple_p25)s, %(roi_multiple_p50)s,
+            %(roi_multiple_p75)s, %(verdict_bucket)s, %(comp_movie_ids)s, %(actual_roi_multiple)s,
+            %(actual_bucket)s
+        )
+        ON CONFLICT (movie_id, stage) DO UPDATE SET
+            computed_at = now(),
+            comp_count = EXCLUDED.comp_count,
+            roi_multiple_p25 = EXCLUDED.roi_multiple_p25,
+            roi_multiple_p50 = EXCLUDED.roi_multiple_p50,
+            roi_multiple_p75 = EXCLUDED.roi_multiple_p75,
+            verdict_bucket = EXCLUDED.verdict_bucket,
+            comp_movie_ids = EXCLUDED.comp_movie_ids,
+            actual_roi_multiple = EXCLUDED.actual_roi_multiple,
+            actual_bucket = EXCLUDED.actual_bucket
+        """,
+        {"movie_id": movie_id, "stage": stage, **verdict},
+    )

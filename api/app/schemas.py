@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import BaseModel
 
@@ -86,3 +86,17 @@ class CompOut(BaseModel):
     shared_genres: list[str] = []
     score: int | None = None
     distance: float | None = None
+
+
+class VerdictOut(BaseModel):
+    stage: str
+    computed_at: datetime
+    comp_count: int
+    roi_multiple_p25: float | None
+    roi_multiple_p50: float | None
+    roi_multiple_p75: float | None
+    verdict_bucket: str | None
+    comp_movie_ids: list[int]
+    actual_roi_multiple: float | None
+    actual_bucket: str | None
+    method: str

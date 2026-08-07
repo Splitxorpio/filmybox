@@ -130,11 +130,17 @@ def process_movie(client: TMDbClient, tmdb_id: int) -> None:
         conn.close()
 
 
-def tmdb_backfill_flow(start_date: str = "2010-01-01", end_date: str | None = None, min_vote_count: int = 50):
+def tmdb_backfill_flow(
+    start_date: str = "2010-01-01",
+    end_date: str | None = None,
+    min_vote_count: int = 50,
+    sort_by: str = "primary_release_date.asc",
+    max_pages: int = 500,
+):
     end_date = end_date or date.today().isoformat()
     client = TMDbClient()
 
-    movie_ids = list(client.discover_movie_ids(start_date, end_date, min_vote_count))
+    movie_ids = list(client.discover_movie_ids(start_date, end_date, min_vote_count, max_pages, sort_by))
     print(f"[tmdb-backfill] discovered {len(movie_ids)} candidate movies")
 
     for i, tmdb_id in enumerate(movie_ids, start=1):
@@ -155,6 +161,8 @@ if __name__ == "__main__":
     parser.add_argument("--start-date", default="2010-01-01")
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--min-vote-count", type=int, default=50)
+    parser.add_argument("--sort-by", default="primary_release_date.asc")
+    parser.add_argument("--max-pages", type=int, default=500)
     args = parser.parse_args()
 
-    tmdb_backfill_flow(args.start_date, args.end_date, args.min_vote_count)
+    tmdb_backfill_flow(args.start_date, args.end_date, args.min_vote_count, args.sort_by, args.max_pages)

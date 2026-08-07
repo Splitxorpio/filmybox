@@ -528,3 +528,43 @@ Both modes tested against *Get Out*: embedding mode returns *Us*/*Nope* at #1/#2
 - Feature engineering / staged GBT model pipeline — the actual core product feature (stage-by-stage verdict + confidence interval), not yet started; everything through this point has been the data layer
 - Trailer/YouTube and Reddit sentiment ingestion
 - Redis caching, automated tests, real Prefect Cloud scheduling
+
+---
+
+## Staged Verdict System v1: Comp-Based Heuristic (Built)
+
+The first version of the project's actual core feature — per-movie, per-stage flop/solid/hit/blockbuster verdicts. Decided upfront (before planning) to ship a comp-based heuristic rather than trained GBT models first, build YouTube trailer ingestion now rather than defer it, and detect stage transitions via a daily scheduled scan rather than on-demand.
+
+### Schema: `verdicts` table
+New (`db/init/004_verdicts.sql`): `movie_id`, `stage`, `comp_count`, ROI percentiles (p25/p50/p75), `verdict_bucket`, `comp_movie_ids` (audit trail), plus `actual_roi_multiple`/`actual_bucket` computed the same way from the movie's own outcome once known — letting the heuristic's accuracy be measured directly rather than just asserted. `UNIQUE(movie_id, stage)`.
+
+### Stage vocabulary and detection
+Reuses `sentiment_snapshots`'s existing stage enum minus `casting_news` (no structured source exists for that — Reddit/Twitter still deferred). `detect_stage()` in `prefect-worker/flows/stage_scan.py` is a pure function with precedence `post_release > pre_release > trailer > teaser > announcement`, driven entirely by data already in the DB (`release_date`, `trailers.publish_date`).
+
+### One flow, unified backfill + incremental scan
+`get_movies_needing_stage_check` (new in `prefect-worker/db.py`) returns movies with no verdict row yet, or whose furthest-reached stage isn't `post_release` — meaning the very first run doubles as the full historical backfill (since ~4,394/4,395 movies are already fully released and land straight in `post_release`), while all future runs only touch genuinely active movies. No separate backfill script was needed.
+
+### Comp-based verdict computation
+Reuses the embedding `<=>` k-NN query from `api/app/queries.py:get_comps_by_embedding`, duplicated into `prefect-worker/db.py:get_comps_for_verdict` per the established cross-service pattern. ROI = `total_worldwide / budget_usd` across the top-15 comps that have both fields; percentiles computed in pure Python (sort + linear interpolation, no new dependency); median bucketed via the plan's original thresholds (<1x flop, 1-3x solid, 3-5x hit, 5x+ blockbuster). Fewer than 3 usable comps → row still written (audit trail) but `verdict_bucket`/percentiles left null rather than guessed.
+
+### YouTube trailer ingestion (`prefect-worker/youtube_client.py`, new)
+`search_trailer` (`search.list`, 100 quota units) and `get_video_stats` (`videos.list`, ~1 unit/call, batches of 50). Deliberately scoped to only search for movies not yet `post_release` and only once (until found) — `search.list` against the full 4,395-movie historical corpus would cost 439,500 units against a 10,000/day free quota, ~44x over, and low-value anyway per the plan's existing note that historical trailer velocity is unreliable.
+
+### Verified
+- First run: all 4,395 movies processed, zero errors, all landed in `post_release` (expected — corpus has no genuinely upcoming movies, see caveat below)
+- 4,395 verdict rows written; bucket distribution: 970 solid, 846 flop, 531 blockbuster, 450 hit (actual outcomes) / 2,478 solid, 771 hit, 552 flop, 330 blockbuster, 264 insufficient-data (predicted)
+- **Accuracy check** (the whole point of storing `actual_bucket` alongside the prediction): strict exact-match accuracy is **36.1%**, barely above the naive **34.7%** baseline of always guessing "solid" (the most common actual outcome) — the v1 heuristic has only marginal signal for fine-grained classification. But **83.3% land within one bucket** of the truth, meaning it does capture rough scale even though precision is weak. This is exactly the outcome the plan anticipated: a real baseline for comparison, not a finished predictor — validates prioritizing this over jumping straight to GBT models, since now there's a concrete number to beat.
+- `GET /movies/{id}/verdicts` verified against *The Beekeeper*: predicted "solid" (comp median 1.72x ROI) vs. actual "hit" (4.65x) — a representative example of the adjacent-bucket-but-not-exact pattern from the accuracy check
+- Re-ran `stage_scan.py` a second time: 0 movies needed rechecking, confirming idempotency
+
+### Early-stage/YouTube path exercised (closed the verification gap)
+Pulled 20 genuinely upcoming movies via a scoped TMDb discover call (`primary_release_date.gte=2026-08-06`, `.lte=2027-02-05`, `min_vote_count=0`, `sort_by=popularity.desc`, 1 page) — `min_vote_count` had to drop to 0 since unreleased titles have near-zero TMDb votes; `sort_by` gained a parameter (previously hardcoded to `primary_release_date.asc`) so this one-off pull could rank by popularity instead and surface notable titles (*Avengers: Doomsday*, *Dune: Part Three*, *Ramayana*, *Coyote vs. Acme*) rather than whatever happened to release first. Built embeddings for the 20, then ran `stage_scan` twice — once before adding a real `YOUTUBE_API_KEY` (`.env` had the placeholder still blank, silently producing zero trailer matches — not a code bug), once after.
+
+- **First run** (no YouTube key): correctly split the 20 into `announcement` (8) / `pre_release` (12) purely from release-date windowing — confirms `detect_stage`'s date-based branches work standalone.
+- **After adding the key**: re-ran `stage_scan`; all 20 picked up real trailers (18 `trailer`, 2 `teaser`) via `search_trailer`, each with real `trailer_metrics` (e.g. *Avengers: Doomsday*: 58.9M views, 2.5M likes). Confirmed `GET /movies/4891/verdicts` (Avengers: Doomsday) returns **two independent rows** — the original frozen `announcement` verdict plus a new `trailer` verdict — proving the "prior stage's row is never touched again" design actually holds under a real stage transition, not just in theory.
+- Comp verdicts for the 20 upcoming movies ranged `solid` to `blockbuster` (no `flop`/`hit` bimodal pattern beyond that), all with `actual_bucket: null` as expected (no box office yet).
+
+### Next steps
+- Real GBT model training, now with the comp-heuristic's 36.1%/83.3% numbers as the baseline to beat
+- Trailer engagement / critic scores feeding into comp weighting, so the confidence interval actually narrows by stage (the explicitly-deferred limitation from this pass)
+- Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling

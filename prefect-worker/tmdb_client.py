@@ -37,12 +37,16 @@ class TMDbClient:
         end_date: str,
         min_vote_count: int = 50,
         max_pages: int = 500,
+        sort_by: str = "primary_release_date.asc",
     ):
         """Yields TMDb movie ids for wide theatrical releases in a date range.
 
         with_release_type=3 restricts to Theatrical (excludes limited/festival
         releases per the v1 backfill scope); vote_count.gte filters out
-        obscure/straight-to-video noise.
+        obscure/straight-to-video noise. sort_by defaults to release-date
+        ascending (historical backfill order); pass "popularity.desc" with
+        min_vote_count=0 to pull notable *upcoming* movies instead, since
+        unreleased titles have near-zero vote counts.
         """
         page = 1
         while page <= max_pages:
@@ -53,7 +57,7 @@ class TMDbClient:
                     "primary_release_date.lte": end_date,
                     "with_release_type": 3,
                     "vote_count.gte": min_vote_count,
-                    "sort_by": "primary_release_date.asc",
+                    "sort_by": sort_by,
                     "page": page,
                 },
             )

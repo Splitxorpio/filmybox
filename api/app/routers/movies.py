@@ -15,6 +15,7 @@ from app.schemas import (
     MovieListResponse,
     MovieSummary,
     StudioOut,
+    VerdictOut,
 )
 
 router = APIRouter(prefix="/movies", tags=["movies"])
@@ -113,3 +114,10 @@ def get_comps(
     if method == "embedding":
         return queries.get_comps_by_embedding(conn, movie_id, limit)
     return queries.get_comps(conn, movie_id, limit)
+
+
+@router.get("/{movie_id}/verdicts", response_model=list[VerdictOut])
+def get_verdicts(movie_id: int, conn: Connection = Depends(get_db)):
+    if queries.get_movie(conn, movie_id) is None:
+        raise HTTPException(status_code=404, detail="Movie not found")
+    return queries.get_verdicts(conn, movie_id)

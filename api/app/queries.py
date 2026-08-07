@@ -228,3 +228,31 @@ def upsert_critic_scores(conn: Connection, movie_id: int, scores: dict) -> None:
         {"movie_id": movie_id, **scores},
     )
     conn.commit()
+
+
+_STAGE_RANK_SQL = """
+    CASE stage
+        WHEN 'announcement' THEN 1
+        WHEN 'teaser' THEN 2
+        WHEN 'trailer' THEN 3
+        WHEN 'pre_release' THEN 4
+        WHEN 'post_release' THEN 5
+    END
+"""
+
+
+def get_verdicts(conn: Connection, movie_id: int) -> list[dict]:
+    rows = conn.execute(
+        text(
+            f"""
+            SELECT stage, computed_at, comp_count, roi_multiple_p25, roi_multiple_p50,
+                   roi_multiple_p75, verdict_bucket, comp_movie_ids, actual_roi_multiple,
+                   actual_bucket, method
+            FROM verdicts
+            WHERE movie_id = :movie_id
+            ORDER BY {_STAGE_RANK_SQL} ASC
+            """
+        ),
+        {"movie_id": movie_id},
+    ).mappings().all()
+    return [dict(row) for row in rows]
