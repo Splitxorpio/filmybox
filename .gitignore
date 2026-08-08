@@ -15,6 +15,9 @@ frontend/out/
 # postgres / data
 db/data/
 
+# trained model artifacts (build output, not source)
+models/
+
 # os
 .DS_Store
 Thumbs.db

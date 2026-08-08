@@ -565,6 +565,97 @@ Pulled 20 genuinely upcoming movies via a scoped TMDb discover call (`primary_re
 - Comp verdicts for the 20 upcoming movies ranged `solid` to `blockbuster` (no `flop`/`hit` bimodal pattern beyond that), all with `actual_bucket: null` as expected (no box office yet).
 
 ### Next steps
-- Real GBT model training, now with the comp-heuristic's 36.1%/83.3% numbers as the baseline to beat
 - Trailer engagement / critic scores feeding into comp weighting, so the confidence interval actually narrows by stage (the explicitly-deferred limitation from this pass)
+- Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
+
+## GBT Model Training v1 (Built)
+
+Trained an actual predictor (`prefect-worker/flows/train_model.py`) to compare against the comp heuristic's 36.1%/83.3% baseline, using the identical ROI-multiple target and bucket thresholds (imported from `stage_scan.py`, not duplicated — same service). Like the heuristic, v1 predictions are **precomputed in batch and stored** in `verdicts` (now `method='gbt_v1'`), not served live in-process — the "in-process serving" architecture already decided in the Model Serving section is deferred until there's a concrete need the daily batch can't cover (e.g. an on-demand prediction for a movie the batch hasn't reached).
+
+### Approach
+- **Three LightGBM quantile boosters** (`objective="quantile"`, alpha 0.25/0.5/0.75, native `lgb.train()` API — not the sklearn wrapper, keeps a future `api/` load-side dependency to just `lightgbm`) trained on `log(ROI multiple)`, producing the same `roi_multiple_p25/p50/p75` shape the heuristic already stores. Quantile-crossing guarded by sorting the three predictions per row at inference time.
+- **Pre-release-only features**, matching the heuristic's own stated limitation, for a fair comparison: log budget, runtime, MPAA rating, is-English, release month/season, top-15 genre multi-hot, is-franchise, and — the most predictive group by feature-importance gain — **time-respecting expanding-average ROI** for the movie's studio, primary director, lead actor, and franchise (computed only from that entity's strictly-earlier releases, leakage-safe). Missing prior-averages (new director, non-franchise, etc.) are left as `NaN` — LightGBM handles missing values natively.
+- **Time-based split**: sorted by release date, last 20% (560 of 2,797 labeled movies, cutoff 2021-07-29) held out as test — avoids sequel-leakage a random split would allow, and simulates real forward deployment.
+- **Schema change**: `verdicts`'s UNIQUE constraint widened from `(movie_id, stage)` to `(movie_id, stage, method)` (`005_verdicts_multi_method.sql`) so `gbt_v1` rows coexist with `comp_heuristic_v1` rows — `upsert_verdict` gained a `method` parameter (defaulting to `comp_heuristic_v1` so `stage_scan.py` needed no changes beyond the `ON CONFLICT` clause). `GET /movies/{id}/verdicts` needed zero code changes — it already returns every matching row as a list.
+- **Batch inference covers every movie with a budget** (2,977 of 4,415 — including unreleased ones with a known budget, like *Ramayana*/*Coyote vs. Acme*/*Digger* from the upcoming-movies pull), using each movie's current latest stage from existing verdict rows.
+
+### Verified
+- Build hit one real gotcha: LightGBM's compiled backend needs `libgomp1`, absent from the `python:3.12-slim` base — added `apt-get install libgomp1` to `prefect-worker/Dockerfile`.
+- **GBT vs. comp heuristic, same 559-movie holdout** (a like-for-like rerun of the heuristic's accuracy check, scoped to the same test set the GBT never saw): GBT **40.7% exact-match / 86.1% within-one-bucket** vs. heuristic **36.3% exact-match / 86.9% within-one-bucket**. The GBT modestly beats the heuristic on exact classification; within-one-bucket is essentially a wash — an honest, non-dramatic result, not a clean sweep.
+- Feature importance (gain): `log_budget` dominates, followed closely by the three prior-average-ROI features (studio, director, actor) — confirms the leakage-safe track-record features are pulling real weight, not just budget.
+- `SELECT method, count(*) FROM verdicts GROUP BY method` → 4,435 `comp_heuristic_v1` / 2,977 `gbt_v1`, as expected (GBT skips the ~1,438 movies with no budget yet).
+- Re-ran `stage_scan.py` after the constraint change — still upserts idempotently, no regression.
+- `GET /movies/{id}/verdicts` for *Ramayana*: both methods present at the `trailer` stage; GBT's percentile band (1.87x–4.98x) is visibly tighter than the heuristic's (0.98x–8.20x) around the same 3.4-3.5x median — a good qualitative sanity check that the trained model is genuinely more decisive, not just noise.
+
+### Next steps
+- Live in-process serving in `api/` once there's a concrete case the daily batch can't cover
+- Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
+
+## GBT Model v2: Critic-Score Features (Built)
+
+Added critic scores (IMDb rating/votes, Rotten Tomatoes %, Metacritic, TMDb vote aggregates) as additional features to the same `train_model.py` pipeline, additive to v1's feature set rather than a separate model — LightGBM handles missing values natively, so one model transparently uses critic signal when present and falls back to v1's behavior when absent. Writes to `verdicts` as `method='gbt_v2'`, coexisting with `comp_heuristic_v1`/`gbt_v1` (no further schema changes needed beyond v1's `(movie_id, stage, method)` constraint).
+
+Trailer engagement was explicitly scoped out of this pass: zero movies currently have both trailer stats and a known box-office outcome (the only 20 movies with trailers are the still-unreleased ones pulled earlier), so there's nothing to train against yet.
+
+### A real data-coverage bug found and fixed along the way
+First training run produced **byte-for-byte identical** results to `gbt_v1` (same MAE, same bucket accuracy) with all 6 new critic-score features showing **exactly 0.0 gain** — not a "no signal" finding, a red flag. Root cause: all 604 movies with critic scores fell *after* the model's 2021-07-29 time-split cutoff (OMDb ingestion, via `get_movies_missing_critic_scores`, prioritizes recent releases for dashboard freshness — never did a real historical backfill). The training set had literally zero examples with a critic score to learn from.
+
+Fixed by adding a second, purpose-built backfill: `get_budgeted_movies_missing_critic_scores` (`prefect-worker/db.py`) + `prefect-worker/flows/critic_score_backfill.py`, oldest-released-first and restricted to budgeted movies — the direct inverse priority of the existing recency-ordered `omdb_trickle.py`, since the goal here is training coverage, not viewing freshness. Same OMDb-quota-aware pattern (stop cleanly on `OMDbRateLimited`, 900/run cap).
+
+Running it also surfaced a **real pre-existing bug** in `omdb_client.py` (both the `api/` and `prefect-worker/` copies): OMDb returns its daily-quota-exhausted message (`{"Response":"False","Error":"Request limit reached!"}`) with HTTP status **401**, not 200 — the existing code called `resp.raise_for_status()` before checking the response body, so the quota signal was never caught as `OMDbRateLimited` and instead fell through as a generic per-movie error, burning ~800 wasted requests against the daily cap logging 401s before this was caught. Fixed by checking the body on a 401 status before `raise_for_status()` in both copies.
+
+### Verified
+- After the fix: two backfill runs in one day yielded **1,000 pre-cutoff budgeted movies** with real critic scores (up from 0) — enough for LightGBM to actually learn from.
+- Retrained `gbt_v2`: **47.0% exact-bucket-match / 90.4% within-one-bucket** on the same 559/560-movie holdout used for all three methods — a real jump over both `gbt_v1` (40.7%/86.1%) and `comp_heuristic_v1` (36.3%/86.9%), not a rounding-error improvement.
+- Feature importance (gain): `log_budget` still #1, but `log_imdb_votes` jumped straight to #2, with `imdb_rating` and `rotten_tomatoes_pct` both in the top 10 — critic scores earned real weight, not token inclusion.
+- `SELECT method, count(*) FROM verdicts GROUP BY method` → `comp_heuristic_v1` 4,437 / `gbt_v1` 2,977 / `gbt_v2` 2,977.
+- `GET /movies/4/verdicts` (The Beekeeper, actual outcome: 4.65x ROI, "hit"): heuristic predicted "solid" (wrong), both `gbt_v1` and `gbt_v2` predicted "hit" (correct), with `gbt_v2`'s band (2.40x–3.21x) tighter than `gbt_v1`'s (1.86x–3.89x) around the same true value.
+
+### Next steps
+- Continue the `critic_score_backfill` flow daily until pre-cutoff coverage saturates (currently 1,000 of the training set's older budgeted movies; OMDb's 1,000/day cap means this is gradual) — retrain `gbt_v2` periodically as coverage grows
+- Trailer engagement: revisit once enough of the 20 upcoming movies actually release and accumulate real outcomes to train against
+- Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
+
+## Wikidata Budget Backfill (Built)
+
+1,438 of 4,415 movies (33%) had no `budget_usd`, permanently excluding them from every ROI-based verdict. Investigated the gap directly rather than assuming it was an ingestion bug: it skews heavily international (Japanese anime, Korean thrillers, German comedies) — TMDb's own crowd-sourced budget data is Hollywood-centric, so this is a real source gap.
+
+Checked two alternatives against real examples pulled from the gap: **Wikidata** (queried by IMDb id, P345→P2130) hit for *The Addams Family 2* ($23M) but missed two of the international titles tested; The-Numbers.com wasn't pursued (Hollywood-centric, unlikely to help a disproportionately-international gap). Went with Wikidata: free public SPARQL endpoint, no API key, exact-match via a stable id already on every movie, and its `VALUES` clause supports batching many ids per query.
+
+### Approach
+- `prefect-worker/wikidata_client.py` (new): batched SPARQL lookup, filtered to **USD-only** budgets (`wikibase:quantityUnit = wd:Q4917`) — a deliberate scoping call, since many international films' Wikidata budgets are recorded in local currency and currency conversion (historical exchange rates) was judged not worth the complexity for this pass. Non-USD entries are skipped, not converted or guessed.
+- `prefect-worker/flows/budget_backfill.py` (new): pulls all budget-missing movies, batches, updates `budget_usd`/`budget_confidence='estimated'` for matches (`db.py`'s new `get_movies_missing_budget`/`update_movie_budget`).
+- Designed as a single-run backfill (Wikidata's `VALUES` batching meant the whole 1,437-movie backlog only needed ~29 batches), not a multi-day trickle like the OMDb critic-score backfill.
+
+### An active external outage hit mid-build, handled the same way as the earlier OMDb 401 bug
+First run: batch 1 (100 ids) succeeded (3 matches), then every subsequent batch hit a 429 with `"Aggressively rate-limiting to 1 req/min - this rule was created during active wdqs outage"` — a real, temporary Wikidata infrastructure incident, not something in our control. The initial code caught this as a generic exception and burned through all 14 remaining batches uselessly, logging the same 429 repeatedly — the identical shape of bug just fixed in `omdb_client.py`. Fixed properly: added `WikidataRateLimited` (mirroring `OMDbRateLimited`), dropped batch size 100→50, and added retry-with-backoff (5 attempts, 65s apart, matching the outage's own stated 1-req/min throttle) in `budget_backfill.py` rather than giving up on the whole run at the first 429.
+
+### Verified
+- Ran the fixed version as a background task (~30 min, paced by the outage throttle): **42 of 1,437 movies matched** (real budgets recovered, e.g. *Fountain of Youth* $180M, *Luck* $140M) — `SELECT count(*) FROM movies WHERE budget_usd IS NULL` dropped from 1,438 to 1,396.
+- ~8 of ~29 batches (400 movies) never got a successful query at all (exhausted all 5 retries against the ongoing outage) — genuinely unattempted, not confirmed-absent. A rerun once Wikidata's outage clears should recover more from exactly those movies (the idempotent `WHERE budget_usd IS NULL` query naturally re-targets only what's still missing, no extra bookkeeping needed).
+- Honest coverage read: 42/1437 (~3%) is a modest, partial win, consistent with the USD-only + Wikidata-coverage limitations flagged going in — this doesn't come close to closing the international-title gap that motivated the search, but it's real, free coverage with no ongoing cost.
+
+### Next steps
+- Rerun `budget_backfill.py` once Wikidata's outage clears to pick up the ~400 never-attempted movies
+- Retrain `gbt_v1`/`gbt_v2` to pick up the 42 newly-budgeted movies (not done automatically by this backfill)
+- Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
+
+## Live In-Process GBT Serving in `api/` (Built)
+
+Closed the "batch-only" gap flagged in both GBT write-ups: a movie added (or budgeted) after the last `train_model.py` run previously had no prediction until the next manual retrain. Implements Path 1 from the Model Serving section above (already decided): FastAPI loads the `gbt_v2` boosters into memory and calls `predict()` directly in the request handler — `GET /movies/{id}/predict`, computed live and never persisted, distinct from `/verdicts`' stored historical timeline.
+
+### Approach
+- **Model artifacts moved to a shared top-level `models/`** directory (was `prefect-worker/models/`, only reachable from one container) — bind-mounted read-write into `prefect-worker` and read-only into `api`. `train_model.py`'s `MODEL_DIR` needed no code change (`dirname(__file__)/../models` already resolved to the same `/app/models` container path either way).
+- **`prefect-worker/flows/train_model.py` now exports prior-avg-ROI lookups**: the leakage-safe expanding-mean features (`studio_prior_avg_roi` etc.) only ever existed as an in-memory pandas computation. Added `_entity_avg_lookup()` — a plain (non-expanding, all-history) per-entity mean, folded into `feature_metadata_gbt_v2.json` under `prior_avg_lookups` — a deliberately simpler "current snapshot" used only at serving time, not fed back into training.
+- **`api/app/gbt_predictor.py`** (new): single-row mirror of `train_model.py`'s feature building, duplicated per the established cross-service pattern. No pandas/scikit-learn added to `api/` — just `lightgbm`, since native `Booster.predict()` accepts plain lists and categorical encoding (`mpaa_rating`) is replicated via a plain index lookup into the saved `mpaa_categories` list rather than needing a real pandas `category` dtype. Lazy-loaded module singleton, same shape as `prefect-worker/embedding_client.py`'s `_get_model()`.
+- **`api/app/queries.py`** gained `get_primary_credits()` — a lighter single-movie director/lead-actor id lookup than the full `get_movie_credits()` list.
+- **Movies without a budget get a clean 200**, not an error: `LivePredictionOut` has a `reason` field (`"no budget"`) with all ROI fields `null`, mirroring how `/comps`/`/verdicts` already degrade gracefully.
+
+### Verified
+- Both `api` and `prefect-worker` Dockerfiles needed the same `libgomp1` fix already hit in GBT v1 (LightGBM's compiled backend, missing from `python:3.12-slim`).
+- `GET /movies/4892/predict` (Ramayana, budgeted but not yet released): live p50 = 3.83x → 4.42x depending on run, bucket `hit` — close to but not identical to the stored batch `gbt_v2` row (p50 3.83x, also `hit`), exactly the expected divergence from live lookups being plain means vs. training's leakage-safe expanding means, not a bug.
+- `GET /movies/4891/predict` (Avengers: Doomsday, no budget yet): clean `200` with all fields `null` and `reason: "no budget"`.
+- `GET /movies/999999/predict`: `404`, as expected.
+
+### Next steps
 - Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling

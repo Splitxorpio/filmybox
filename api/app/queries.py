@@ -94,6 +94,34 @@ def get_movie_credits(conn: Connection, movie_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_primary_credits(conn: Connection, movie_id: int) -> tuple[int | None, int | None]:
+    """(primary_director_id, lead_actor_id) - the two person ids
+    gbt_predictor.py needs for its prior-avg-ROI lookups, without pulling
+    the full credits list get_movie_credits already returns.
+    """
+    director_id = conn.execute(
+        text(
+            """
+            SELECT person_id FROM movie_credits
+            WHERE movie_id = :movie_id AND role_type = 'director'
+            ORDER BY billing_order NULLS LAST LIMIT 1
+            """
+        ),
+        {"movie_id": movie_id},
+    ).scalar_one_or_none()
+    actor_id = conn.execute(
+        text(
+            """
+            SELECT person_id FROM movie_credits
+            WHERE movie_id = :movie_id AND role_type = 'actor'
+            ORDER BY billing_order NULLS LAST LIMIT 1
+            """
+        ),
+        {"movie_id": movie_id},
+    ).scalar_one_or_none()
+    return director_id, actor_id
+
+
 def get_box_office(conn: Connection, movie_id: int) -> tuple[dict | None, list[dict]]:
     totals = conn.execute(
         text(

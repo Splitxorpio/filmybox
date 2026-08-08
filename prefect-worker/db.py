@@ -108,6 +108,29 @@ def upsert_movie_credit(
     )
 
 
+def get_movies_missing_budget(cur) -> list[tuple[int, str]]:
+    """(movie_id, imdb_id) for movies with no budget_usd - candidates for
+    the Wikidata backfill (see wikidata_client.py / budget_backfill.py).
+    """
+    cur.execute(
+        """
+        SELECT id, imdb_id FROM movies
+        WHERE budget_usd IS NULL AND imdb_id IS NOT NULL
+        """
+    )
+    return cur.fetchall()
+
+
+def update_movie_budget(cur, movie_id: int, budget_usd: int) -> None:
+    cur.execute(
+        """
+        UPDATE movies SET budget_usd = %s, budget_confidence = 'estimated', updated_at = now()
+        WHERE id = %s
+        """,
+        (budget_usd, movie_id),
+    )
+
+
 def get_movies_missing_box_office(cur) -> list[tuple[int, str]]:
     """(movie_id, imdb_id) for movies not yet scraped from Box Office Mojo."""
     cur.execute(
@@ -232,6 +255,29 @@ def get_movies_missing_critic_scores(cur, limit: int) -> list[tuple[int, str]]:
         LEFT JOIN critic_scores cs ON cs.movie_id = m.id
         WHERE m.imdb_id IS NOT NULL AND cs.movie_id IS NULL
         ORDER BY m.release_date DESC NULLS LAST
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return cur.fetchall()
+
+
+def get_budgeted_movies_missing_critic_scores(cur, limit: int) -> list[tuple[int, str]]:
+    """(movie_id, imdb_id), oldest released first, restricted to movies with
+    a budget. Separate purpose from get_movies_missing_critic_scores (which
+    prioritizes recency for dashboard freshness): this backfills historical
+    coverage specifically for GBT training, where the existing recency-first
+    trickle left 0 pre-2021-07-29 movies with a critic score (see planning
+    doc's GBT v2 section) - oldest-first directly closes that gap.
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.imdb_id
+        FROM movies m
+        LEFT JOIN critic_scores cs ON cs.movie_id = m.id
+        WHERE m.imdb_id IS NOT NULL AND cs.movie_id IS NULL
+          AND m.budget_usd IS NOT NULL AND m.budget_usd > 0
+        ORDER BY m.release_date ASC NULLS LAST
         LIMIT %s
         """,
         (limit,),
@@ -384,19 +430,63 @@ def get_comps_for_verdict(cur, movie_id: int, limit: int) -> list[tuple[int, obj
     return cur.fetchall()
 
 
-def upsert_verdict(cur, movie_id: int, stage: str, verdict: dict) -> None:
+def get_movies_for_training(cur) -> list[dict]:
+    """All movies with a budget, plus everything needed to build GBT features:
+    box office (nullable - only present for released movies), studio/franchise
+    ids, director/lead-actor person ids (first-billed of each role), critic
+    scores (nullable - only present for movies OMDb/TMDb trickle has reached).
+    """
+    cur.execute(
+        """
+        SELECT
+            m.id, m.release_date, m.genres, m.runtime_minutes, m.mpaa_rating,
+            m.original_language, m.budget_usd, m.studio_id, m.franchise_id,
+            bot.total_worldwide,
+            cs.imdb_rating, cs.imdb_votes, cs.rotten_tomatoes_pct, cs.metacritic_score,
+            cs.tmdb_vote_average, cs.tmdb_vote_count,
+            (SELECT array_agg(mc.person_id ORDER BY mc.billing_order NULLS LAST)
+             FROM movie_credits mc WHERE mc.movie_id = m.id AND mc.role_type = 'director') AS director_ids,
+            (SELECT mc.person_id FROM movie_credits mc
+             WHERE mc.movie_id = m.id AND mc.role_type = 'actor'
+             ORDER BY mc.billing_order NULLS LAST LIMIT 1) AS lead_actor_id
+        FROM movies m
+        LEFT JOIN box_office_totals bot ON bot.movie_id = m.id
+        LEFT JOIN critic_scores cs ON cs.movie_id = m.id
+        WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
+        ORDER BY m.release_date NULLS LAST
+        """
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def get_latest_stages(cur) -> dict[int, str]:
+    """movie_id -> furthest-reached stage, for every movie with a verdict row."""
+    cur.execute(
+        f"""
+        SELECT movie_id, stage FROM (
+            SELECT movie_id, stage,
+                   ROW_NUMBER() OVER (PARTITION BY movie_id ORDER BY {_STAGE_RANK_SQL} DESC) AS rn
+            FROM verdicts
+        ) ranked WHERE rn = 1
+        """
+    )
+    return dict(cur.fetchall())
+
+
+def upsert_verdict(cur, movie_id: int, stage: str, verdict: dict, method: str = "comp_heuristic_v1") -> None:
     cur.execute(
         """
         INSERT INTO verdicts (
-            movie_id, stage, comp_count, roi_multiple_p25, roi_multiple_p50, roi_multiple_p75,
+            movie_id, stage, method, comp_count, roi_multiple_p25, roi_multiple_p50, roi_multiple_p75,
             verdict_bucket, comp_movie_ids, actual_roi_multiple, actual_bucket
         )
         VALUES (
-            %(movie_id)s, %(stage)s, %(comp_count)s, %(roi_multiple_p25)s, %(roi_multiple_p50)s,
+            %(movie_id)s, %(stage)s, %(method)s, %(comp_count)s, %(roi_multiple_p25)s, %(roi_multiple_p50)s,
             %(roi_multiple_p75)s, %(verdict_bucket)s, %(comp_movie_ids)s, %(actual_roi_multiple)s,
             %(actual_bucket)s
         )
-        ON CONFLICT (movie_id, stage) DO UPDATE SET
+        ON CONFLICT (movie_id, stage, method) DO UPDATE SET
             computed_at = now(),
             comp_count = EXCLUDED.comp_count,
             roi_multiple_p25 = EXCLUDED.roi_multiple_p25,
@@ -407,5 +497,5 @@ def upsert_verdict(cur, movie_id: int, stage: str, verdict: dict) -> None:
             actual_roi_multiple = EXCLUDED.actual_roi_multiple,
             actual_bucket = EXCLUDED.actual_bucket
         """,
-        {"movie_id": movie_id, "stage": stage, **verdict},
+        {"movie_id": movie_id, "stage": stage, "method": method, **verdict},
     )

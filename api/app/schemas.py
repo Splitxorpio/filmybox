@@ -100,3 +100,13 @@ class VerdictOut(BaseModel):
     actual_roi_multiple: float | None
     actual_bucket: str | None
     method: str
+
+
+class LivePredictionOut(BaseModel):
+    roi_multiple_p25: float | None
+    roi_multiple_p50: float | None
+    roi_multiple_p75: float | None
+    verdict_bucket: str | None
+    method: str
+    computed_at: datetime
+    reason: str | None = None

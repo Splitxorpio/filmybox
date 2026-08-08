@@ -25,6 +25,14 @@ def fetch_critic_scores(imdb_id: str, api_key: str) -> dict | None:
     Raises OMDbRateLimited if the daily quota is exhausted.
     """
     resp = httpx.get(OMDB_BASE_URL, params={"i": imdb_id, "apikey": api_key}, timeout=10.0)
+    # OMDb returns 401 (not 200) once the daily quota is exhausted, with the
+    # same {"Response":"False","Error":"Request limit reached!"} body a
+    # normal "not found" response uses - check the body before raise_for_status
+    # would otherwise mask it as a generic HTTP error.
+    if resp.status_code == 401:
+        data = resp.json()
+        if data.get("Error") == "Request limit reached!":
+            raise OMDbRateLimited()
     resp.raise_for_status()
     data = resp.json()
 

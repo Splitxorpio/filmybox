@@ -3,7 +3,9 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.engine import Connection
 
-from app import queries
+from datetime import datetime, timezone
+
+from app import gbt_predictor, queries
 from app.config import settings
 from app.db import get_db
 from app.omdb_client import OMDbRateLimited, fetch_critic_scores
@@ -11,6 +13,7 @@ from app.schemas import (
     CompOut,
     CriticScoresOut,
     FranchiseOut,
+    LivePredictionOut,
     MovieDetail,
     MovieListResponse,
     MovieSummary,
@@ -121,3 +124,31 @@ def get_verdicts(movie_id: int, conn: Connection = Depends(get_db)):
     if queries.get_movie(conn, movie_id) is None:
         raise HTTPException(status_code=404, detail="Movie not found")
     return queries.get_verdicts(conn, movie_id)
+
+
+@router.get("/{movie_id}/predict", response_model=LivePredictionOut)
+def predict(movie_id: int, conn: Connection = Depends(get_db)):
+    """Live gbt_v2 prediction, computed on the spot rather than read from
+    verdicts - covers movies the last batch train_model.py run hasn't
+    reached yet (see planning doc's Model Serving section).
+    """
+    movie = queries.get_movie(conn, movie_id)
+    if movie is None:
+        raise HTTPException(status_code=404, detail="Movie not found")
+
+    director_id, actor_id = queries.get_primary_credits(conn, movie_id)
+    critic_scores = queries.get_critic_scores(conn, movie_id)
+
+    result = gbt_predictor.predict_verdict(movie, director_id, actor_id, critic_scores)
+    now = datetime.now(timezone.utc)
+    if result is None:
+        return LivePredictionOut(
+            roi_multiple_p25=None,
+            roi_multiple_p50=None,
+            roi_multiple_p75=None,
+            verdict_bucket=None,
+            method=gbt_predictor.METHOD,
+            computed_at=now,
+            reason="no budget",
+        )
+    return LivePredictionOut(**result, computed_at=now)
