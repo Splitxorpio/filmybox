@@ -17,6 +17,7 @@ from app.schemas import (
     MovieDetail,
     MovieListResponse,
     MovieSummary,
+    SentimentSnapshotOut,
     StudioOut,
     VerdictOut,
 )
@@ -124,6 +125,13 @@ def get_verdicts(movie_id: int, conn: Connection = Depends(get_db)):
     if queries.get_movie(conn, movie_id) is None:
         raise HTTPException(status_code=404, detail="Movie not found")
     return queries.get_verdicts(conn, movie_id)
+
+
+@router.get("/{movie_id}/sentiment", response_model=list[SentimentSnapshotOut])
+def get_sentiment(movie_id: int, conn: Connection = Depends(get_db)):
+    if queries.get_movie(conn, movie_id) is None:
+        raise HTTPException(status_code=404, detail="Movie not found")
+    return queries.get_sentiment(conn, movie_id)
 
 
 @router.get("/{movie_id}/predict", response_model=LivePredictionOut)

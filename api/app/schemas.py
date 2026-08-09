@@ -102,6 +102,15 @@ class VerdictOut(BaseModel):
     method: str
 
 
+class SentimentSnapshotOut(BaseModel):
+    source: str
+    stage: str
+    snapshot_date: datetime
+    sentiment_score: float | None
+    volume: int | None
+    avg_engagement_score: float | None
+
+
 class LivePredictionOut(BaseModel):
     roi_multiple_p25: float | None
     roi_multiple_p50: float | None

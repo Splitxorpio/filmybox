@@ -732,3 +732,31 @@ The lowest-priority, explicitly-deferred data source from the original plan ("mo
    ```
 4. Re-run `reddit_sentiment_backfill` daily (or on a schedule once real Prefect Cloud scheduling lands) until it reports 0 remaining — likely several dozen runs given the training population size.
 5. Once real data exists, feed `avg_engagement_score`/`sentiment_score`/`volume` into `train_model.py` as new GBT features (not done here — out of scope for ingestion v1) and evaluate whether they actually improve `gbt_v2`'s predictions before committing to them long-term, given the "most fragile source" concern that deferred this in the first place.
+
+## Thread-Based Sentiment: YouTube Trailer Comments + Bluesky (Built)
+
+Reddit sentiment was fully built but blocked on an unpredictable external gate: Reddit's 2026 "Responsible Builder Policy" closed self-service registration, requires filing a ticket and waiting for approval, and explicitly calls out ML-training use cases as needing separate sign-off — reports describe hobbyist requests being ghosted rather than denied, no reliable timeline. Rather than wait, added two more thread-based sources that don't have that problem.
+
+### Sources chosen and why
+- **YouTube trailer comments** — the most directly on-topic signal possible: literal reactions to the trailer/teaser itself, not just title mentions elsewhere. `commentThreads.list` costs 1 quota unit/call (vs. 100 for the `search.list` calls `trailer_backfill.py`/`stage_scan.py` already use), trivial against the shared 10,000/day budget. No new credentials — reuses `YOUTUBE_API_KEY`.
+- **Bluesky** — free and self-service (a real account + an instantly-generated "app password," no approval queue), unlike Reddit. Verified empirically before building anything: `public.api.bsky.app` (the endpoint some guides describe as "no auth needed") blocks non-browser traffic at the CDN layer with a raw 403 — not a real API response — while the actual PDS endpoint `bsky.social` returns a clean `{"error":"AuthMissing"}` for search without a session token. So real auth is required, just self-service rather than approval-gated.
+- The-Numbers/Letterboxd/X considered and rejected before building anything: X's free tier is gone (pay-per-use, $0.005/read, no free tier); Letterboxd's API is by-request-only (same slow-approval shape as Reddit) and review-focused rather than thread-based, not matching what was actually asked for.
+
+### Approach
+- **Generalized the shared sentiment-scoring module** rather than write a third copy of the lexicon/aggregation logic: `reddit_sentiment.py` → `sentiment_scoring.py`, `summarize_posts(posts)` → `summarize_items(items)` taking a source-agnostic `{"id", "text", "engagement"}` shape. Both existing Reddit flows updated to normalize their Reddit-specific post shape into this before calling — no behavior change, just DRY.
+- **`youtube_client.py`** gained `get_top_level_comments()` — top-level comments only for v1 (no reply-thread traversal, matches this project's repeated "keep v1 scope reasonable" pattern). Comments-disabled-on-video is a real, expected case (some trailers disable them) — returns `[]`, not an error.
+- **`bluesky_client.py`** (new) — session-based auth (`com.atproto.server.createSession`), `app.bsky.feed.searchPosts`, `BlueskyRateLimited`/`BlueskyAuthError` checked from status/body *before* `raise_for_status()` — the OMDb/Wikidata lesson from earlier today applied proactively this time instead of discovered the hard way a third time.
+- **YouTube comments cover every movie with a trailer regardless of release status** (one flow, `flows/youtube_comment_sentiment.py`) — unlike Reddit's released-vs-upcoming split, a trailer's reception is relevant whether the movie's out yet or not. Uses each trailer's own `trailer_type` as the snapshot's `stage`.
+- **Bluesky mirrors Reddit's exact two-flow shape** (`bluesky_buzz_upcoming.py` eager/small, `bluesky_sentiment_backfill.py` quota-throttled/large, same training-relevant budget+box-office population as Reddit's backfill) — `db.py` gained `get_movies_needing_comment_sentiment`/`get_movies_for_bluesky_backfill` alongside the existing Reddit queries.
+- `db/init/007_sentiment_snapshots_bluesky.sql` — widened `sentiment_snapshots.source`'s CHECK constraint to include `'bluesky'` (already permitted `'youtube_comments'`/`'twitter'` from the original schema).
+
+### Verified
+- `youtube_comment_sentiment.py`: 110/110 trailers processed in one run (0 remaining against the current trailer population — will keep pace automatically as `trailer_backfill.py` adds more). Real, varied output — e.g. *Weapons* (100 comments, sentiment 0.64) vs. *Highest 2 Lowest* (100 comments, sentiment -0.45) vs. *The Naked Gun* (100 comments, sentiment -0.03) — genuine signal spread, not placeholder data.
+- `bluesky_buzz_upcoming.py`: all 18 upcoming movies refreshed in one run. Real spread here too — e.g. *Dune: Part Three* and *The Dog Stars* both hit sentiment 1.0 (unanimous positive lexicon hits in a small sample), *Avengers: Doomsday* at a more modest 0.14 despite the highest engagement score (0.95) of the batch.
+- `bluesky_sentiment_backfill.py`: 250 movies processed (hit its per-run cap) on the first real run. 2,766 of the ~3,016 training-relevant population remain — needs continued periodic runs, same shape as every other quota-throttled backfill in this project.
+- Both sources' `sentiment_snapshots` rows verified against the live DB (not just script exit codes): `source='youtube_comments'` → 110 rows (108 trailer, 2 teaser); `source='bluesky'` → 268 rows (250 post_release, 18 pre_release).
+
+### Next steps
+- Keep re-running `bluesky_sentiment_backfill.py` periodically until it reports 0 remaining (2,766 movies left as of this run)
+- Once meaningful coverage exists across all three sentiment sources (Reddit still blocked on credentials, YouTube comments and Bluesky both live now), feed `avg_engagement_score`/`sentiment_score`/`volume` per source into `train_model.py` as `gbt_v3` features and evaluate whether they actually help, same as GBT v2's critic-score evaluation
+- Redis caching, automated tests, real Prefect Cloud scheduling

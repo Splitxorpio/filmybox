@@ -23,7 +23,7 @@ import os
 
 from db import get_connection, get_movies_for_reddit_backfill, upsert_sentiment_snapshot
 from reddit_client import RedditAuthError, RedditRateLimited, search_movie_mentions
-from reddit_sentiment import summarize_posts
+from sentiment_scoring import summarize_items
 
 MAX_PER_RUN = 250
 
@@ -62,7 +62,11 @@ def reddit_sentiment_backfill_flow():
                 print(f"[reddit-sentiment-backfill] error fetching '{movie['title']}': {exc}")
                 continue
 
-            summary = summarize_posts(posts)
+            items = [
+                {"id": p["id"], "text": f"{p['title']} {p.get('selftext', '')}", "engagement": p.get("score", 0)}
+                for p in posts
+            ]
+            summary = summarize_items(items)
             with conn.cursor() as cur:
                 upsert_sentiment_snapshot(
                     cur,

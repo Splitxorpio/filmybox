@@ -578,6 +578,52 @@ def get_movies_for_reddit_backfill(cur, limit: int) -> list[dict]:
     return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
+def get_movies_needing_comment_sentiment(cur, limit: int) -> list[dict]:
+    """(movie_id, title, external_id, trailer_type) for the primary trailer
+    (sequence_number=1) of every movie that has one, regardless of release
+    status - trailer reactions are relevant whether the movie has come out
+    yet or not, unlike Reddit's released-vs-upcoming split. Excludes trailers
+    that already have a youtube_comments snapshot for their own stage.
+    """
+    cur.execute(
+        """
+        SELECT m.id AS movie_id, m.title, t.external_id, t.trailer_type
+        FROM movies m
+        JOIN trailers t ON t.movie_id = m.id AND t.sequence_number = 1
+        LEFT JOIN sentiment_snapshots ss
+            ON ss.movie_id = m.id AND ss.stage = t.trailer_type AND ss.source = 'youtube_comments'
+        WHERE ss.movie_id IS NULL
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def get_movies_for_bluesky_backfill(cur, limit: int) -> list[dict]:
+    """Same population/reasoning as get_movies_for_reddit_backfill, keyed to
+    source='bluesky' instead - independent coverage tracking per source.
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.title, m.release_date
+        FROM movies m
+        JOIN box_office_totals bot ON bot.movie_id = m.id
+        LEFT JOIN sentiment_snapshots ss
+            ON ss.movie_id = m.id AND ss.stage = 'post_release' AND ss.source = 'bluesky'
+        WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
+          AND m.release_date IS NOT NULL AND m.release_date <= CURRENT_DATE
+          AND ss.movie_id IS NULL
+        ORDER BY m.release_date ASC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
 def upsert_sentiment_snapshot(
     cur,
     movie_id: int,

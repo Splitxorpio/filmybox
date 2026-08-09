@@ -269,6 +269,21 @@ _STAGE_RANK_SQL = """
 """
 
 
+def get_sentiment(conn: Connection, movie_id: int) -> list[dict]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT source, stage, snapshot_date, sentiment_score, volume, avg_engagement_score
+            FROM sentiment_snapshots
+            WHERE movie_id = :movie_id
+            ORDER BY source, snapshot_date DESC
+            """
+        ),
+        {"movie_id": movie_id},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def get_verdicts(conn: Connection, movie_id: int) -> list[dict]:
     rows = conn.execute(
         text(

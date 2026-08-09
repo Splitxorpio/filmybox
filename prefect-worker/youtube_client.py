@@ -44,6 +44,36 @@ def search_trailer(title: str, year: int | None, api_key: str) -> dict | None:
     }
 
 
+def get_top_level_comments(video_id: str, api_key: str, max_results: int = 100) -> list[dict]:
+    """One commentThreads.list call (1 unit - far cheaper than search.list's
+    100). Returns top-level comments only (no reply-thread traversal, v1
+    scope) as [{"id", "text", "engagement"}, ...]. Comments disabled on the
+    video is a real, expected case (not every trailer allows them) - returns
+    [] rather than raising, same style as search_trailer's None-on-nothing.
+    """
+    try:
+        data = _get(
+            "/commentThreads",
+            {"part": "snippet", "videoId": video_id, "maxResults": min(max_results, 100), "key": api_key},
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 403:
+            return []
+        raise
+
+    comments = []
+    for item in data.get("items", []):
+        top = item["snippet"]["topLevelComment"]["snippet"]
+        comments.append(
+            {
+                "id": item["id"],
+                "text": top.get("textDisplay", ""),
+                "engagement": top.get("likeCount", 0),
+            }
+        )
+    return comments
+
+
 def get_video_stats(video_ids: list[str], api_key: str) -> dict[str, dict]:
     """One videos.list call per <=50 ids (~1 unit each). Returns
     {video_id: {"view_count", "like_count", "comment_count"}}.
