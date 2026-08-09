@@ -3,6 +3,21 @@ from datetime import date, datetime
 from pydantic import BaseModel
 
 
+class UserRegisterIn(BaseModel):
+    email: str
+    password: str
+
+
+class UserLoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+
+
 class StudioOut(BaseModel):
     id: int
     name: str

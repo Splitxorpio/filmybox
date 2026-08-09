@@ -2,7 +2,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 
-def _build_movie_filters(genre: str | None, year: int | None, search: str | None) -> tuple[str, dict]:
+def _build_movie_filters(
+    genre: str | None, year: int | None, search: str | None, upcoming: bool = False
+) -> tuple[str, dict]:
     clauses = []
     params: dict = {}
     if genre:
@@ -14,8 +16,27 @@ def _build_movie_filters(genre: str | None, year: int | None, search: str | None
     if search:
         clauses.append("m.title ILIKE :search")
         params["search"] = f"%{search}%"
+    if upcoming:
+        clauses.append("m.release_date > CURRENT_DATE")
     where_sql = " AND ".join(clauses) if clauses else "TRUE"
     return where_sql, params
+
+
+def create_user(conn: Connection, email: str, password_hash: str) -> dict:
+    row = conn.execute(
+        text("INSERT INTO users (email, password_hash) VALUES (:email, :password_hash) RETURNING id, email"),
+        {"email": email, "password_hash": password_hash},
+    ).mappings().first()
+    conn.commit()
+    return dict(row)
+
+
+def get_user_by_email(conn: Connection, email: str) -> dict | None:
+    row = conn.execute(
+        text("SELECT id, email, password_hash FROM users WHERE email = :email"),
+        {"email": email},
+    ).mappings().first()
+    return dict(row) if row else None
 
 
 def list_movies(
@@ -25,8 +46,10 @@ def list_movies(
     search: str | None,
     limit: int,
     offset: int,
+    upcoming: bool = False,
 ) -> tuple[int, list[dict]]:
-    where_sql, params = _build_movie_filters(genre, year, search)
+    where_sql, params = _build_movie_filters(genre, year, search, upcoming)
+    order_sql = "m.release_date ASC" if upcoming else "m.release_date DESC NULLS LAST"
 
     total = conn.execute(text(f"SELECT count(*) FROM movies m WHERE {where_sql}"), params).scalar_one()
 
@@ -40,7 +63,7 @@ def list_movies(
                 LEFT JOIN studios s ON s.id = m.studio_id
                 LEFT JOIN box_office_totals bot ON bot.movie_id = m.id
                 WHERE {where_sql}
-                ORDER BY m.release_date DESC NULLS LAST
+                ORDER BY {order_sql}
                 LIMIT :limit OFFSET :offset
                 """
             ),

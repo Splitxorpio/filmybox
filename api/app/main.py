@@ -4,10 +4,11 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.db import engine
-from app.routers import movies
+from app.routers import auth, movies
 
 app = FastAPI(title="FilmyBox API")
 app.include_router(movies.router)
+app.include_router(auth.router)
 
 
 @app.get("/health")

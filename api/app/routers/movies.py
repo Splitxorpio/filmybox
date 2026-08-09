@@ -30,11 +30,12 @@ def list_movies(
     genre: str | None = None,
     year: int | None = None,
     search: str | None = None,
+    upcoming: bool = False,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     conn: Connection = Depends(get_db),
 ):
-    total, rows = queries.list_movies(conn, genre, year, search, limit, offset)
+    total, rows = queries.list_movies(conn, genre, year, search, limit, offset, upcoming)
     items = [
         MovieSummary(
             id=row["id"],
