@@ -214,7 +214,8 @@ def train_model_flow():
                     """
                     SELECT v.movie_id, v.verdict_bucket, v.actual_bucket
                     FROM verdicts v
-                    WHERE v.method = %s AND v.movie_id = ANY(%s) AND v.verdict_bucket IS NOT NULL
+                    WHERE v.method = %s AND v.movie_id = ANY(%s)
+                        AND v.verdict_bucket IS NOT NULL AND v.actual_bucket IS NOT NULL
                     """,
                     (other_method, test_df["id"].tolist()),
                 )

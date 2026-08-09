@@ -616,6 +616,15 @@ Running it also surfaced a **real pre-existing bug** in `omdb_client.py` (both t
 - Trailer engagement: revisit once enough of the 20 upcoming movies actually release and accumulate real outcomes to train against
 - Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
 
+### 2026-08-08 retrain — Wikidata budget backfill + more critic-score coverage
+Retrained `gbt_v2` after the Wikidata budget backfill (+42 movies with budgets) and further `critic_score_backfill`/`omdb_trickle` runs grew coverage (`budget_usd` now on 3,022 movies, `critic_scores.imdb_rating` on 2,880). Training pool grew to 3,022 budgeted movies (2,266 train / 567 test, time-split at 2021-07-28, up from the 559/560-movie holdout in the original write-up above).
+
+**Hit and fixed a real bug getting here**: `train_model.py`'s 3-way comparison query pulled frozen `comp_heuristic_v1`/`gbt_v1` verdict rows filtered only on `verdict_bucket IS NOT NULL`, not `actual_bucket IS NOT NULL`. Some of those frozen rows were written back when their movies were still unreleased and never got backfilled with an outcome — with the larger/shifted test set, one such row surfaced and crashed `_bucket_accuracy` on `None`. Fixed by adding `AND v.actual_bucket IS NOT NULL` to that query (`prefect-worker/flows/train_model.py`) — doesn't touch the evaluation methodology, just guards against comparing on rows with no known outcome, which was always the intent.
+
+Results: **`gbt_v2` 49.4% exact / 90.8% within-one** vs `gbt_v1` 40.9%/86.1% and `comp_heuristic_v1` 36.3%/87.0% (on 562-563 test movies) — a modest but real improvement over the original write-up's 47.0%/90.4% for `gbt_v2`, consistent with "more data, same signal" rather than a step change. Top features unchanged in character: `log_imdb_votes` #1 this run (was #2), `log_budget` #2, critic-score features (`imdb_rating`, `rotten_tomatoes_pct`, `metacritic_score`) still solidly in the top 10. Wrote 3,022 fresh `gbt_v2` verdict rows (up from 2,977).
+
+**Unreleased-movie coverage is the real limiter, not the model**: of the 18 movies with `release_date > CURRENT_DATE`, only 5 have a `budget_usd` and therefore a `gbt_v2` verdict (The End of Oak Street, Coyote vs. Acme, The Dog Stars, Digger, Ramayana) — all landed in the "solid" bucket, p50 ROI 1.16x-2.52x. Neither Avengers: Doomsday nor Dune: Part Three has a budget yet, so neither has a batch verdict; the live `/predict` endpoint returns a clean `reason: "no budget"` 200 for both, matching the documented behavior above. The Wikidata backfill's 42 recovered budgets (see below) didn't happen to include any of the still-unbudgeted tentpoles.
+
 ## Wikidata Budget Backfill (Built)
 
 1,438 of 4,415 movies (33%) had no `budget_usd`, permanently excluding them from every ROI-based verdict. Investigated the gap directly rather than assuming it was an ingestion bug: it skews heavily international (Japanese anime, Korean thrillers, German comedies) — TMDb's own crowd-sourced budget data is Hollywood-centric, so this is a real source gap.
@@ -635,9 +644,21 @@ First run: batch 1 (100 ids) succeeded (3 matches), then every subsequent batch 
 - ~8 of ~29 batches (400 movies) never got a successful query at all (exhausted all 5 retries against the ongoing outage) — genuinely unattempted, not confirmed-absent. A rerun once Wikidata's outage clears should recover more from exactly those movies (the idempotent `WHERE budget_usd IS NULL` query naturally re-targets only what's still missing, no extra bookkeeping needed).
 - Honest coverage read: 42/1437 (~3%) is a modest, partial win, consistent with the USD-only + Wikidata-coverage limitations flagged going in — this doesn't come close to closing the international-title gap that motivated the search, but it's real, free coverage with no ongoing cost.
 
+### Additional source investigated and rejected: The-Numbers.com
+Looked for a second budget source to cover more of the remaining gap (1,396 of 1,438 originally missing, still uncovered after Wikidata). The-Numbers.com was the obvious next candidate — a real budget-tracking trade site — but two problems surfaced on direct investigation, not assumption:
+- **No documented search API or reliable URL pattern.** Its movie URLs need title+year+**country** disambiguation (e.g. `/movie/September-5-(2024-Germany)`), and its canonical titles don't always match ours (our `"Ghostland"` is their `"Incident in a Ghostland"`) — would need real search/matching infrastructure, not simple slug construction, i.e. BOM-level scraper fragility risk a second time.
+- **Budgets are paywalled for most titles.** A 7-movie probe (fetching actual pages directly, since search-engine-summarized answers turned out unreliable — one reported a $40M figure for *The Two Popes* that wasn't actually on the page) found only **2 of 7 (~29%) had a public budget figure**; the rest showed "full financial estimates... available through our research services" instead.
+
+Given ~29% publicly-available *before* even accounting for real-world match-rate loss from the title-matching problem, the expected yield didn't justify the scraper-fragility cost. Decision: not pursued. Recorded here so this path isn't re-investigated from scratch later — the negative result is the useful part.
+
+### A fourth source checked, same ceiling: Box Office Mojo's own Budget field
+Before writing off further budget sourcing, checked whether Box Office Mojo — already scraped reliably via `bom_client.py`'s proven, IMDb-ID-keyed pattern (no title-matching risk, unlike Wikidata/The Numbers) — exposes budget on the title pages already being fetched for box office. It does (`Budget$190,000,000` for a well-known blockbuster tested first), which looked promising since it would've meant near-zero incremental scraping risk.
+
+But a 12-movie probe across the actual remaining gap (random sample, mixed English/international) found only **2/12 (~17%) had a budget on BOM** — the same pattern seen on TMDb, Wikidata, and The Numbers: present for well-known titles, absent for the smaller/mid-tier films that make up most of the remaining gap. **Four independent sources now show the same ceiling.** This reads less like "haven't found the right source" and more like a genuine data-availability limit — budgets for smaller and international films simply aren't well-documented in public English-language sources. Decision: not pursued further, despite BOM's low implementation risk, since the expected yield doesn't justify even a low-risk re-scrape. Budget coverage for this segment of the corpus is treated as a real, structural gap going forward, not a to-do.
+
 ### Next steps
 - Rerun `budget_backfill.py` once Wikidata's outage clears to pick up the ~400 never-attempted movies
-- Retrain `gbt_v1`/`gbt_v2` to pick up the 42 newly-budgeted movies (not done automatically by this backfill)
+- Retrain `gbt_v1`/`gbt_v2` to pick up the newly-budgeted movies (not done automatically by this backfill)
 - Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
 
 ## Live In-Process GBT Serving in `api/` (Built)
@@ -659,3 +680,55 @@ Closed the "batch-only" gap flagged in both GBT write-ups: a movie added (or bud
 
 ### Next steps
 - Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
+
+## Trailer Backfill for the Training Corpus (Built)
+
+The GBT v2 write-up flagged trailer engagement as scoped out because zero movies had both trailer stats and a known outcome. Root cause, confirmed by reading `stage_scan.py`: it only ever searches YouTube for trailers on movies **not yet `post_release`**, specifically to conserve `search.list`'s 100-unit cost against YouTube's 10,000/day free quota (~100 searches/day possible at all). The already-released, budgeted, outcome-known corpus that `train_model.py` actually trains on (~3,000 movies via `get_movies_for_training`) had never had a trailer search run against it — the only 20 existing trailer rows were all from a batch of still-unreleased test movies with no outcome yet.
+
+### Approach
+- `prefect-worker/db.py` gained `get_released_movies_missing_trailer(cur, limit)`: released (`release_date <= CURRENT_DATE`), `budget_usd` set, has a `box_office_totals` row, no `trailers` row yet — the same population `get_movies_for_training()` selects, joined against what's missing. Ordered most-recent-release-first: recent titles are far more likely to return a real official trailer from a plain title search than older/obscure ones (unrelated or fan-made results), maximizing hit rate per unit of quota.
+- `prefect-worker/flows/trailer_backfill.py` (new): plain-Python flow (no `@flow`/`@task`, matching the established pattern), reusing `youtube_client.py`'s existing `search_trailer`/`get_video_stats`/`YouTubeQuotaExceeded` and `db.py`'s existing `get_trailers_for_movie`/`insert_trailer`/`upsert_trailer_metrics` unchanged. `MAX_PER_RUN = 90`, leaving headroom under the ~100/day ceiling. Stops cleanly on `YouTubeQuotaExceeded`, same shape as `critic_score_backfill.py`'s OMDb handling — no retry loop.
+- Deliberately additive: `stage_scan.py` was not touched and keeps its existing not-yet-post_release-only trailer search behavior for its own purpose (ongoing stage detection).
+
+### Verified
+- Ran once: **90/90 movies processed, 90/90 got a matching trailer** (every recent, well-known, budgeted title returned a real official-trailer hit — no misses this run, though that won't hold as the backlog moves to older/smaller titles).
+- `trailer_outcome_pairs` (trailers joined to a budgeted movie with a `box_office_totals` row): **0 → 90**. This is the number that actually matters — it was the literal blocker for training on trailer engagement at all.
+- Total `trailers` rows: 20 → 110.
+- Remaining backlog: 2,926 released/budgeted/outcome-known movies still missing a trailer (3,016 before this run).
+- Also ran `critic_score_backfill.py` and `omdb_trickle.py` in the same session to keep pushing critic-score coverage: both reported **0/795 and 0/900 processed respectively, hitting OMDb's daily rate limit immediately** — the day's 1,000-request OMDb quota was already exhausted by earlier work before these runs started. Critic-score coverage is unchanged this run: 2,880 movies overall with an IMDb rating, 2,219 of those among budgeted movies (out of 3,022 budgeted movies total, ~73.4%).
+
+### Next steps
+- **Re-run daily** — YouTube quota resets every 24h and this only gets through ~90 movies/day against a 2,926-movie backlog (~33 days at this rate, assuming hit rate stays high): `docker compose run --rm --no-deps prefect-worker python -m flows.trailer_backfill`
+- Once enough (trailer, known-outcome) pairs accumulate (dozens isn't enough for LightGBM to find real signal — likely need low hundreds at least), add trailer engagement (view/like/comment counts) as `gbt_v3` features, same additive pattern as v2's critic scores
+- Re-run `critic_score_backfill.py`/`omdb_trickle.py` on a day when OMDb's quota hasn't already been used by other work, to keep closing the remaining critic-score gap (803 of 3,022 budgeted movies, ~26.6%, still missing a score)
+- Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
+
+## Reddit Sentiment Ingestion v1 (Built, blocked on credentials)
+
+The lowest-priority, explicitly-deferred data source from the original plan ("most fragile source," never built). Picked up now. Two distinct populations, per the product thesis: **pre-release buzz** (`movies.release_date > CURRENT_DATE`) — a genuinely new signal not available from any other source in the pipeline — and a **historical backfill for released movies**, scoped to exactly the population that matters for GBT training (`budget_usd` present AND a `box_office_totals` row), so this becomes a usable model feature rather than a display curiosity.
+
+### Approach
+- **`prefect-worker/reddit_client.py`** (new): OAuth2 client-credentials grant (Reddit "script" app, app-only/read-only — no end-user login needed for a server-side search job). Token cached in-process. Searches a fixed multi-subreddit set (`movies`, `boxoffice`, `trailers` — `DEFAULT_SUBREDDITS`, could be made configurable later) via `/r/{sub1}+{sub2}+{sub3}/search`, quoting the title and appending the release year to cut down false matches on generic titles. Same rate-limit-before-`raise_for_status()` lesson as `omdb_client.py`/`wikidata_client.py`: checks for `429` (and `403`, which for Reddit usually means an expired/invalid token, not "no results") before `raise_for_status()` would otherwise mask either as a generic HTTP error. `RedditRateLimited`/`RedditAuthError` let calling flows stop cleanly instead of hammering a wall. `RateLimiter(max_per_second=0.9)`, staying under Reddit's ~60 req/min script-app ceiling with margin.
+- **`prefect-worker/reddit_sentiment.py`** (new): pure aggregation, shared by both flows so they compute metrics identically. Primary v1 metrics — mention volume (post count) and average engagement (Reddit's upvote-based post `score`) — are the trustworthy signal per the task scope. A lexicon-based sentiment score (~25 hand-picked positive/negative words, matched against post title+selftext) is the explicit stretch goal; it returns `None` (not a fake `0.0`) when a movie has zero lexicon hits, so "no signal" is never conflated with "neutral."
+- **`sentiment_snapshots` didn't fit as originally scaffolded** — checked before assuming it was right, per the task instructions. Its `source`/`stage`/`sentiment_score`/`volume`/`raw_sample_ids` columns all lined up, but two things were missing: no column for the primary engagement-score metric, and no uniqueness constraint to upsert against (it was designed as an open-ended append-only time series, but a "refresh this stage's snapshot in place" model — same as `verdicts`' `(movie_id, stage, method)` upsert — is simpler and matches how every other re-run in this pipeline behaves). `db/init/006_sentiment_snapshots_reddit.sql` adds `avg_engagement_score NUMERIC` and `UNIQUE (movie_id, stage, source)`; applied directly to the live DB via `docker compose exec postgres psql` since `db/init/` only runs on a fresh volume.
+- **`db.py`** gained three functions: `get_upcoming_movies_for_sentiment()` (the full unreleased set — no `LIMIT`, no "missing" filter, since buzz is expected to change run over run and the upsert just refreshes in place), `get_movies_for_reddit_backfill(limit)` (mirrors `get_movies_for_training()`'s core filter, oldest-first, excludes movies with an existing `post_release`/`reddit` snapshot), and `upsert_sentiment_snapshot()`.
+- **Two flows, not one** — deliberate split, matching the two populations' very different operational shape: `flows/reddit_buzz_upcoming.py` processes the whole (small, currently 18-movie) unreleased set every run, meant to be re-run eagerly/often since pre-release buzz is time-sensitive. `flows/reddit_sentiment_backfill.py` is the large, quota-throttled historical job (`MAX_PER_RUN = 250`, one Reddit request per movie at ~1 req/sec ≈ 4-5 min/run), meant to be re-run daily until it reports 0 remaining, same pattern as `critic_score_backfill.py`. Both are plain functions, no `@flow`/`@task`, per the established project convention.
+
+### Verified
+- `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` in `.env` are still empty placeholders (`REDDIT_USER_AGENT` has a placeholder value too — `filmybox/0.1 by yourusername`). **No real API calls have been made; this cannot ingest real data yet.**
+- Migration applied to the live DB: `ALTER TABLE sentiment_snapshots ADD CONSTRAINT ... UNIQUE (movie_id, stage, source)` and `ADD COLUMN avg_engagement_score NUMERIC` both ran clean against the running `postgres` container.
+- `get_upcoming_movies_for_sentiment()` against live data returns 18 movies (earliest: two titles releasing 2026-08-12). `get_movies_for_reddit_backfill(5)` correctly returns the oldest budgeted+box-office movies (`Daybreakers`, `Leap Year`, `Henry's Crime`, `Tooth Fairy`, `The Book of Eli`, all Jan 2010) — confirms the training-population filter and ordering are right.
+- Ran `reddit_buzz_upcoming_flow()` for real against the live DB with `search_movie_mentions` monkeypatched to return two fixed fake posts (no real network call — no credentials to make one with): confirmed the full path — aggregation (`volume=2`, `avg_engagement_score=62.5`, `sentiment_score=-0.5` from the fake lexicon-negative post) → upsert → all 18 rows landed correctly in `sentiment_snapshots`. **Deleted these 18 mocked rows afterward** so no fake sentiment data is left in the live database.
+- Confirmed the empty-credential path exits cleanly: `docker compose run --rm --no-deps prefect-worker python -m flows.reddit_buzz_upcoming` prints `REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET not set, skipping` and exits 0, same shape as `critic_score_backfill.py` without `OMDB_API_KEY`.
+- Not verified (no credentials): real Reddit search results, real rate-limit handling against Reddit's actual 429 behavior, real-world lexicon sentiment quality (the 25-word list is a rough first pass, not tuned against any labeled data).
+
+### Next steps
+1. **Create a Reddit "script" app**: go to https://www.reddit.com/prefs/apps while logged into a Reddit account, click "create app," choose type **script**, leave the redirect URI as `http://localhost:8080` (unused by client-credentials but required by the form). This gives a client ID (under the app name) and a client secret.
+2. Set `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET` in `.env` to those values, and replace `REDDIT_USER_AGENT`'s placeholder (`filmybox/0.1 by yourusername`) with a real Reddit username per Reddit's API rules (unique, descriptive user agents are required — generic ones get silently throttled harder).
+3. First real run, small population first to sanity-check real output before the larger batch job:
+   ```
+   docker compose run --rm --no-deps prefect-worker python -m flows.reddit_buzz_upcoming
+   docker compose run --rm --no-deps prefect-worker python -m flows.reddit_sentiment_backfill
+   ```
+4. Re-run `reddit_sentiment_backfill` daily (or on a schedule once real Prefect Cloud scheduling lands) until it reports 0 remaining — likely several dozen runs given the training population size.
+5. Once real data exists, feed `avg_engagement_score`/`sentiment_score`/`volume` into `train_model.py` as new GBT features (not done here — out of scope for ingestion v1) and evaluate whether they actually improve `gbt_v2`'s predictions before committing to them long-term, given the "most fragile source" concern that deferred this in the first place.

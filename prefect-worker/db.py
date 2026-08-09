@@ -474,6 +474,34 @@ def get_latest_stages(cur) -> dict[int, str]:
     return dict(cur.fetchall())
 
 
+def get_released_movies_missing_trailer(cur, limit: int) -> list[tuple[int, str, object]]:
+    """(movie_id, title, release_date) for already-released movies with both
+    budget_usd and a box_office_totals row (the exact population
+    get_movies_for_training() trains on) that have no trailers row yet.
+    Most-recent-release first: recent movies are far more likely to have a
+    real trailer indexed on YouTube under a title search (older/obscure
+    titles frequently return unrelated or fan-made results), so this order
+    maximizes hit rate per unit of quota spent - separate purpose from
+    stage_scan.py, which never touches this already-released population at
+    all (see planning doc).
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.title, m.release_date
+        FROM movies m
+        JOIN box_office_totals bot ON bot.movie_id = m.id
+        LEFT JOIN trailers t ON t.movie_id = m.id
+        WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
+          AND m.release_date IS NOT NULL AND m.release_date <= CURRENT_DATE
+          AND t.movie_id IS NULL
+        ORDER BY m.release_date DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return cur.fetchall()
+
+
 def upsert_verdict(cur, movie_id: int, stage: str, verdict: dict, method: str = "comp_heuristic_v1") -> None:
     cur.execute(
         """
@@ -498,4 +526,81 @@ def upsert_verdict(cur, movie_id: int, stage: str, verdict: dict, method: str = 
             actual_bucket = EXCLUDED.actual_bucket
         """,
         {"movie_id": movie_id, "stage": stage, "method": method, **verdict},
+    )
+
+
+def get_upcoming_movies_for_sentiment(cur) -> list[dict]:
+    """(id, title, release_date) for every movie not yet released - the full
+    set, not just ones missing a snapshot, since pre_release buzz is
+    expected to change run over run and upsert_sentiment_snapshot() just
+    refreshes the row in place. Small population (unreleased titles only),
+    so no LIMIT - the reddit_buzz_upcoming flow is meant to run eagerly/
+    frequently against this whole set.
+    """
+    cur.execute(
+        """
+        SELECT id, title, release_date
+        FROM movies
+        WHERE release_date IS NOT NULL AND release_date > CURRENT_DATE
+        ORDER BY release_date ASC
+        """
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def get_movies_for_reddit_backfill(cur, limit: int) -> list[dict]:
+    """(id, title, release_date) for released movies with a budget AND a
+    box_office_totals row - mirrors get_movies_for_training()'s population
+    (minus the budget-only relaxation) so Reddit sentiment lands on exactly
+    the movies that matter for GBT features, not the whole catalog. Oldest-
+    first, same reasoning as get_budgeted_movies_missing_critic_scores: closes
+    historical coverage gaps first rather than re-trickling recent releases
+    that other sources already cover well. Excludes movies that already have
+    a post_release reddit snapshot.
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.title, m.release_date
+        FROM movies m
+        JOIN box_office_totals bot ON bot.movie_id = m.id
+        LEFT JOIN sentiment_snapshots ss
+            ON ss.movie_id = m.id AND ss.stage = 'post_release' AND ss.source = 'reddit'
+        WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
+          AND m.release_date IS NOT NULL AND m.release_date <= CURRENT_DATE
+          AND ss.movie_id IS NULL
+        ORDER BY m.release_date ASC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def upsert_sentiment_snapshot(
+    cur,
+    movie_id: int,
+    stage: str,
+    sentiment_score: float | None,
+    volume: int,
+    avg_engagement_score: float | None,
+    raw_sample_ids: list[str],
+    source: str = "reddit",
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO sentiment_snapshots (
+            movie_id, stage, snapshot_date, source, sentiment_score, volume,
+            avg_engagement_score, raw_sample_ids
+        )
+        VALUES (%s, %s, now(), %s, %s, %s, %s, %s)
+        ON CONFLICT (movie_id, stage, source) DO UPDATE SET
+            snapshot_date = now(),
+            sentiment_score = EXCLUDED.sentiment_score,
+            volume = EXCLUDED.volume,
+            avg_engagement_score = EXCLUDED.avg_engagement_score,
+            raw_sample_ids = EXCLUDED.raw_sample_ids
+        """,
+        (movie_id, stage, source, sentiment_score, volume, avg_engagement_score, raw_sample_ids),
     )
