@@ -121,13 +121,27 @@ def get_movies_missing_budget(cur) -> list[tuple[int, str]]:
     return cur.fetchall()
 
 
-def update_movie_budget(cur, movie_id: int, budget_usd: int) -> None:
+def get_movies_missing_budget_titles(cur) -> list[tuple[int, str, object]]:
+    """(movie_id, title, release_date) for the same population as
+    get_movies_missing_budget - a title+year variant for budget_social_backfill.py,
+    which searches by title rather than looking up by imdb_id.
+    """
     cur.execute(
         """
-        UPDATE movies SET budget_usd = %s, budget_confidence = 'estimated', updated_at = now()
+        SELECT id, title, release_date FROM movies
+        WHERE budget_usd IS NULL
+        """
+    )
+    return cur.fetchall()
+
+
+def update_movie_budget(cur, movie_id: int, budget_usd: int, confidence: str = "estimated") -> None:
+    cur.execute(
+        """
+        UPDATE movies SET budget_usd = %s, budget_confidence = %s, updated_at = now()
         WHERE id = %s
         """,
-        (budget_usd, movie_id),
+        (budget_usd, confidence, movie_id),
     )
 
 

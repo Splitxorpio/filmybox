@@ -76,21 +76,13 @@ def _authenticate(handle: str, app_password: str) -> str:
     return token
 
 
-def search_movie_mentions(
-    title: str,
-    year: int | None,
-    handle: str,
-    app_password: str,
-    limit: int = 100,
-) -> list[dict]:
-    """Searches Bluesky posts matching `title` (+ year, to disambiguate
-    generic titles). Returns [{"id", "text", "engagement"}, ...],
-    engagement = like count. Raises BlueskyRateLimited / BlueskyAuthError;
-    callers should stop the run on either rather than continue.
+def _search_posts(query: str, handle: str, app_password: str, limit: int) -> list[dict]:
+    """Raw searchPosts call shared by every query-specific search function
+    below - auth/rate-limit/error-handling lives here once. Returns
+    Bluesky's raw post objects (callers normalize as needed for their
+    own use case).
     """
     token = _authenticate(handle, app_password)
-
-    query = f'"{title}" trailer' + (f" {year}" if year else "")
 
     _limiter.wait()
     resp = httpx.get(
@@ -108,10 +100,26 @@ def search_movie_mentions(
         _session_cache.access_jwt = None
         raise BlueskyAuthError(f"Bluesky returned 401 (token invalid/expired?): {resp.text}")
     resp.raise_for_status()
-    data = resp.json()
+    return resp.json().get("posts", [])
+
+
+def search_movie_mentions(
+    title: str,
+    year: int | None,
+    handle: str,
+    app_password: str,
+    limit: int = 100,
+) -> list[dict]:
+    """Searches Bluesky posts matching `title` (+ year, to disambiguate
+    generic titles). Returns [{"id", "text", "engagement"}, ...],
+    engagement = like count. Raises BlueskyRateLimited / BlueskyAuthError;
+    callers should stop the run on either rather than continue.
+    """
+    query = f'"{title}" trailer' + (f" {year}" if year else "")
+    posts = _search_posts(query, handle, app_password, limit)
 
     items = []
-    for post in data.get("posts", []):
+    for post in posts:
         record = post.get("record", {})
         items.append(
             {
@@ -121,3 +129,22 @@ def search_movie_mentions(
             }
         )
     return items
+
+
+def search_budget_mentions(
+    title: str,
+    year: int | None,
+    handle: str,
+    app_password: str,
+    limit: int = 100,
+) -> list[str]:
+    """Searches Bluesky posts matching `title` + "budget" (a different query
+    from search_movie_mentions's trailer-reaction search - deliberately
+    separate, see budget_extraction.py / the planning doc for why "title
+    trailer" and "title budget" surface almost entirely different posts).
+    Returns raw post text only - this feeds budget_extraction.py's regex
+    consensus logic, not sentiment_scoring.py, so no id/engagement needed.
+    """
+    query = f'"{title}" budget' + (f" {year}" if year else "")
+    posts = _search_posts(query, handle, app_password, limit)
+    return [post.get("record", {}).get("text", "") for post in posts]

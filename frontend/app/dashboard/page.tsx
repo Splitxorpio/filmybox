@@ -1,4 +1,5 @@
 import { getServerSession } from "next-auth";
+import Link from "next/link";
 import { redirect } from "next/navigation";
 
 import { authOptions } from "@/lib/auth";
@@ -85,8 +86,12 @@ export default async function Dashboard() {
           </thead>
           <tbody className="divide-y divide-slate-800">
             {movies.map((movie) => (
-              <tr key={movie.id}>
-                <td className="px-4 py-3 font-medium">{movie.title}</td>
+              <tr key={movie.id} className="transition hover:bg-slate-900/50">
+                <td className="px-4 py-3 font-medium">
+                  <Link href={`/dashboard/${movie.id}`} className="hover:text-indigo-400 hover:underline">
+                    {movie.title}
+                  </Link>
+                </td>
                 <td className="px-4 py-3 text-slate-400">
                   {movie.release_date ?? "TBD"}
                 </td>

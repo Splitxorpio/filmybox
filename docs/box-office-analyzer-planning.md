@@ -760,3 +760,56 @@ Reddit sentiment was fully built but blocked on an unpredictable external gate: 
 - Keep re-running `bluesky_sentiment_backfill.py` periodically until it reports 0 remaining (2,766 movies left as of this run)
 - Once meaningful coverage exists across all three sentiment sources (Reddit still blocked on credentials, YouTube comments and Bluesky both live now), feed `avg_engagement_score`/`sentiment_score`/`volume` per source into `train_model.py` as `gbt_v3` features and evaluate whether they actually help, same as GBT v2's critic-score evaluation
 - Redis caching, automated tests, real Prefect Cloud scheduling
+
+## Frontend MVP: Landing, About, Auth, Dashboard (Built)
+
+First real UI — `frontend/` had been an untouched Next.js scaffold all session. Built: landing page, about page, real multi-user auth (NextAuth v4, email/password via a Credentials provider), and a protected dashboard listing upcoming movies with predictions, plus a per-movie timeline page.
+
+### Approach
+- **Auth goes through the FastAPI backend, not a direct Postgres connection from Next.js** — new `POST /auth/register`/`POST /auth/login` endpoints (bcrypt hashing, new `users` table via `008_users.sql`), NextAuth's `authorize()` calls them server-side via the existing `API_INTERNAL_URL` pattern already used by the health-check page. Keeps the "only `api/`/`prefect-worker/` touch Postgres" invariant intact rather than adding a second independent DB client into the frontend.
+- JWT session strategy (no sessions table needed). Route protection via `getServerSession` + redirect in each protected page, not middleware (one protected route family so far).
+- Tailwind CSS added for styling (`tailwind.config.ts`, `postcss.config.mjs`, `app/globals.css`).
+- `GET /movies` gained an `upcoming: bool` query param (filters `release_date > CURRENT_DATE`, orders ascending) for the dashboard's list.
+- New `GET /movies/{id}/sentiment` endpoint — the sentiment data built earlier (YouTube comments, Bluesky) had zero API exposure until this pass.
+- Dashboard does N+1 fetches (one `/movies?upcoming=true` call, then one `/verdicts` call per row via `Promise.all`) — deliberately not optimized into a single SQL join at ~18 rows.
+- **Movie timeline page** (`/dashboard/[id]`): added after finding a real gap while testing — the dashboard originally collapsed each movie down to its single latest `gbt_v2` verdict, which made a retrain-driven prediction change (Ramayana's p50 moved between retrains as more budgets/critic scores landed elsewhere in the corpus, shifting its comps' track-record features) look like an unexplained mystery. The `verdicts` table already stores one frozen row per lifecycle stage (announcement/teaser/trailer/pre_release/post_release) per method — this was never surfaced in the UI. The detail page now shows every stage's full method breakdown (comp heuristic, gbt_v1, gbt_v2) plus sentiment data, reusing the existing `/verdicts` and `/sentiment` endpoints with zero backend changes.
+- Explicitly scoped out (confirmed via direct question): a true append-only history of every recompute *within* a stage — the existing per-stage-frozen model is the intended granularity, not a live audit log of every retrain.
+
+### Bugs hit and fixed during verification
+- Frontend returned 500s on every page after adding Tailwind/NextAuth: a stale anonymous Docker volume (`/app/node_modules`) from an earlier container was shadowing the freshly-built image's `node_modules`, which didn't have the new deps. Fixed with `docker compose rm -sf frontend && docker compose up -d --force-recreate --renew-anon-volumes frontend`.
+- The new `/dashboard/[id]` dynamic route 404'd even after the file existed on disk — Next.js's dev-mode file watcher missed the new directory over the Docker-on-Windows bind mount. Fixed with a plain `docker compose restart frontend` to force route re-discovery.
+
+### Verified
+- All public pages (`/`, `/about`, `/login`, `/register`) return 200; `/dashboard` and `/dashboard/[id]` correctly 307-redirect to `/login` when unauthenticated.
+- Full registration → login → dashboard flow confirmed working end-to-end via the browser (register 200, credentials callback 200, session established, dashboard renders).
+- Dashboard correctly shows real predictions for the 5 budgeted upcoming movies and an honest "no prediction yet" for the other 13 (budget-gap-limited, not a bug — consistent with the earlier budget-source research).
+
+### Next steps
+- Movie detail/timeline page could extend to non-upcoming (released) movies too — currently only linked from the upcoming-movies dashboard
+- Redis caching, automated tests, real Prefect Cloud scheduling
+- Wire sentiment into the model as `gbt_v3` features (still the top substantive next step, unrelated to the frontend work)
+
+## Wikipedia Infobox Budget Backfill (Built)
+
+A third budget source, after Wikidata's structured `P2130` claim (only 42 matches — sparse) and a Bluesky social-consensus attempt (`budget_extraction.py`'s consensus-gated dollar-figure extraction, requiring 2+ corroborating posts within a tight bucket) that was built, tested, and **reverted** after real bad data surfaced on spot-check: common-word titles ("Border," "Run," "The Congress") pulled in wildly wrong figures from unrelated posts (a government-prison-budget post matching a "budget" search), and even on real matches, different posts disagreed by up to $85M (Dune: Part Two: $165M/$190M/$250M across different posts). Not trustworthy enough to write into the model; rolled back before any of it reached `movies.budget_usd`.
+
+Wikipedia infobox turned out to be the better source: **correct-by-construction** (resolves the exact Wikipedia article via Wikidata's own sitelink relationship, keyed off IMDb id — no title-matching ambiguity the way Bluesky's free-text search had) and a single citation-backed field per movie, not scattered chatter needing consensus.
+
+### Approach
+- `prefect-worker/wikipedia_client.py`: `get_sitelinks()` batches IMDb-id → English Wikipedia article resolution via the same Wikidata SPARQL `VALUES` pattern `wikidata_client.py` already uses; `fetch_infobox_budget()` fetches the article's parsed HTML and extracts the infobox's Budget row. USD-only, same scope decision as the Wikidata backfill (non-`$` values skipped, not converted).
+- `prefect-worker/flows/budget_wikipedia_backfill.py`: two-step per the client's shape — batch-resolve sitelinks (cheap), then fetch+parse each resolved article individually (the real rate-limited step, no batching possible for arbitrary page content).
+
+### Two real bugs found and fixed during verification
+- **Range parsing**: first live test returned `None` for every movie, including ones known to have a budget. Root cause: infobox budgets are frequently a *range* ("$190–250 million"), not a single figure — the original regex expected one number immediately followed by its unit and silently failed to match. Fixed by extending the regex to capture an optional second bound and using the range midpoint (e.g. Furious 7's "$190–250 million" → $220M).
+- **Anonymous-API burst limit**: the flow repeatedly stalled after ~10 requests regardless of client-side pacing (tried 2 req/sec, then 0.5 req/sec — same wall both times). Isolated it with a direct sequential test outside the rate limiter: exactly 10 clean requests, then a real `You are making too many requests to the API` response from Wikipedia's anonymous-tier rate limit (a burst allowance, not a steady-state rate — confirmed independent of request spacing). Added `WikipediaRateLimited` (same status-check-before-`raise_for_status()` pattern as every other source this session) and retry-with-backoff (5 attempts, 30s apart) to `budget_wikipedia_backfill.py`, rather than treating it as a hard stop.
+
+### Verified
+- Full run (background, ~4 hours wall-clock, paced by the retry backoff): **1,291 Wikipedia articles resolved, 213 matched** with a real USD budget — `movies.budget_usd IS NULL` count dropped from 1,389 to 1,176.
+- Real recovered budgets spot-checked directly against the actual Wikipedia infobox during debugging (Furious 7 $220M, Inception $160M, The Dark Knight $185M, Titanic $200M, Avatar $237M) — all correct.
+- `SELECT budget_confidence, count(*) FROM movies GROUP BY budget_confidence` → 3,239 `estimated` / 1,176 `unknown` (up from 2,977/1,438 combined across all budget sources this session — Wikidata's 42 + Wikipedia's 213 + earlier partial runs).
+- Run stopped just short of the full backlog (1,350/1,388 batches) on one last sitelink-batch rate limit — a rerun would pick up the remaining ~38.
+
+### Next steps
+- Rerun `budget_wikipedia_backfill.py` to close the last ~38-movie gap
+- Retrain `gbt_v1`/`gbt_v2` to pick up the 213 newly-budgeted movies — the biggest single-session budget gain so far, worth a fresh retrain
+- Redis caching, automated tests, real Prefect Cloud scheduling, wiring sentiment into `gbt_v3`
