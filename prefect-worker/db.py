@@ -121,6 +121,31 @@ def get_movies_missing_budget(cur) -> list[tuple[int, str]]:
     return cur.fetchall()
 
 
+def get_movies_missing_budget_unchecked_wikipedia(cur) -> list[tuple[int, str]]:
+    """(movie_id, imdb_id) for movies with no budget_usd that have NOT yet
+    been definitively checked against Wikipedia's infobox (see
+    010_wikipedia_budget_checked.sql for why this exists - without it,
+    budget_wikipedia_backfill.py re-runs just re-scan the same
+    already-failed movies forever).
+    """
+    cur.execute(
+        """
+        SELECT id, imdb_id FROM movies
+        WHERE budget_usd IS NULL AND imdb_id IS NOT NULL AND NOT wikipedia_budget_checked
+        """
+    )
+    return cur.fetchall()
+
+
+def mark_wikipedia_budget_checked(cur, movie_id: int) -> None:
+    """Only call when Wikipedia gave a *definitive* answer for this movie
+    (found a budget, no Wikipedia article exists, or the article has no USD
+    budget field) - never for a movie that was merely rate-limited and never
+    actually resolved, since that's still an unknown, not a "no".
+    """
+    cur.execute("UPDATE movies SET wikipedia_budget_checked = true WHERE id = %s", (movie_id,))
+
+
 def get_movies_missing_budget_titles(cur) -> list[tuple[int, str, object]]:
     """(movie_id, title, release_date) for the same population as
     get_movies_missing_budget - a title+year variant for budget_social_backfill.py,

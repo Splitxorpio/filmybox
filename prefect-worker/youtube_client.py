@@ -16,7 +16,16 @@ class YouTubeQuotaExceeded(Exception):
 
 def _get(path: str, params: dict) -> dict:
     resp = _client.get(path, params=params)
-    if resp.status_code == 403 and "quota" in resp.text.lower():
+    # Two distinct "back off" signals from YouTube: 403 for daily quota
+    # exhaustion, and 429 for a short-term burst rate limit (seen when
+    # multiple flows hit the API concurrently) - both call for the same
+    # "stop this run" response from callers, so both raise the same
+    # exception rather than only checking the 403+quota-text case (which
+    # let 429s fall through to raise_for_status() as generic per-item
+    # errors, burning through an entire remaining batch uselessly - the
+    # same bug class already fixed in omdb_client.py/wikidata_client.py/
+    # wikipedia_client.py this session).
+    if resp.status_code == 429 or (resp.status_code == 403 and "quota" in resp.text.lower()):
         raise YouTubeQuotaExceeded()
     resp.raise_for_status()
     return resp.json()

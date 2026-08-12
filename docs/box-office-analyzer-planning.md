@@ -703,6 +703,9 @@ The GBT v2 write-up flagged trailer engagement as scoped out because zero movies
 - Re-run `critic_score_backfill.py`/`omdb_trickle.py` on a day when OMDb's quota hasn't already been used by other work, to keep closing the remaining critic-score gap (803 of 3,022 budgeted movies, ~26.6%, still missing a score)
 - Reddit sentiment pull, Redis caching, automated tests, real Prefect Cloud scheduling
 
+### Bug fixed 2026-08-10: YouTube 429 misclassified as a generic per-item error
+Running all backfills in parallel surfaced a fourth instance of the same bug class hit earlier this session (OMDb 401, Wikidata 429, Wikipedia's anonymous burst limit): YouTube's `_get()` in `youtube_client.py` only treated `403 + "quota" in body` as the "stop the run" signal, so a genuine `429 Too Many Requests` (a short-term burst limit, distinct from daily quota exhaustion — likely triggered by running trailer_backfill concurrently with other flows) fell through to `raise_for_status()` as a generic per-item error. `trailer_backfill.py`'s broad `except Exception: continue` then burned through 67 of a 90-movie batch logging the same 429 repeatedly instead of stopping (only 23/90 matched that run, vs. 90/90 the prior run). Fixed by also raising `YouTubeQuotaExceeded` on 429, not just the quota-403 case. Confirmed working: the very next run reported a clean `"daily quota exhausted after 0/90 - stopping"` instead of 90 wasted retries.
+
 ## Reddit Sentiment Ingestion v1 (Built, blocked on credentials)
 
 The lowest-priority, explicitly-deferred data source from the original plan ("most fragile source," never built). Picked up now. Two distinct populations, per the product thesis: **pre-release buzz** (`movies.release_date > CURRENT_DATE`) — a genuinely new signal not available from any other source in the pipeline — and a **historical backfill for released movies**, scoped to exactly the population that matters for GBT training (`budget_usd` present AND a `box_office_totals` row), so this becomes a usable model feature rather than a display curiosity.
@@ -810,6 +813,6 @@ Wikipedia infobox turned out to be the better source: **correct-by-construction*
 - Run stopped just short of the full backlog (1,350/1,388 batches) on one last sitelink-batch rate limit — a rerun would pick up the remaining ~38.
 
 ### Next steps
-- Rerun `budget_wikipedia_backfill.py` to close the last ~38-movie gap
+- ~~Rerun `budget_wikipedia_backfill.py` to close the last ~38-movie gap~~ — done, but revealed a real limitation: `get_movies_missing_budget()` has no way to distinguish "already tried, no Wikipedia budget exists" from "never attempted," so re-running mostly re-scans the same already-failed movies. Two re-runs on 2026-08-10 processed 971 movies combined and matched **0** — confirms the first run's 213 was likely close to this source's real ceiling for this corpus, not an artifact of stopping early. Would need a "permanently exhausted" marker (new column or table) to make re-runs productive; not implemented, since the expected yield is low regardless
 - Retrain `gbt_v1`/`gbt_v2` to pick up the 213 newly-budgeted movies — the biggest single-session budget gain so far, worth a fresh retrain
 - Redis caching, automated tests, real Prefect Cloud scheduling, wiring sentiment into `gbt_v3`
