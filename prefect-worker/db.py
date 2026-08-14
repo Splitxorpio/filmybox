@@ -473,7 +473,10 @@ def get_movies_for_training(cur) -> list[dict]:
     """All movies with a budget, plus everything needed to build GBT features:
     box office (nullable - only present for released movies), studio/franchise
     ids, director/lead-actor person ids (first-billed of each role), critic
-    scores (nullable - only present for movies OMDb/TMDb trickle has reached).
+    scores (nullable - only present for movies OMDb/TMDb trickle has reached),
+    sentiment (nullable - bluesky's own post_release stage and whichever
+    single trailer-stage snapshot youtube_comments has, per sequence_number=1
+    upstream in trailers).
     """
     cur.execute(
         """
@@ -483,6 +486,11 @@ def get_movies_for_training(cur) -> list[dict]:
             bot.total_worldwide,
             cs.imdb_rating, cs.imdb_votes, cs.rotten_tomatoes_pct, cs.metacritic_score,
             cs.tmdb_vote_average, cs.tmdb_vote_count,
+            bs.sentiment_score AS bluesky_sentiment_score, bs.volume AS bluesky_volume,
+            bs.avg_engagement_score AS bluesky_avg_engagement,
+            ys.sentiment_score AS youtube_sentiment_score, ys.volume AS youtube_volume,
+            ys.avg_engagement_score AS youtube_avg_engagement,
+
             (SELECT array_agg(mc.person_id ORDER BY mc.billing_order NULLS LAST)
              FROM movie_credits mc WHERE mc.movie_id = m.id AND mc.role_type = 'director') AS director_ids,
             (SELECT mc.person_id FROM movie_credits mc
@@ -491,6 +499,14 @@ def get_movies_for_training(cur) -> list[dict]:
         FROM movies m
         LEFT JOIN box_office_totals bot ON bot.movie_id = m.id
         LEFT JOIN critic_scores cs ON cs.movie_id = m.id
+        LEFT JOIN sentiment_snapshots bs
+            ON bs.movie_id = m.id AND bs.source = 'bluesky' AND bs.stage = 'post_release'
+        LEFT JOIN LATERAL (
+            SELECT sentiment_score, volume, avg_engagement_score
+            FROM sentiment_snapshots
+            WHERE movie_id = m.id AND source = 'youtube_comments'
+            ORDER BY snapshot_date DESC LIMIT 1
+        ) ys ON true
         WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
         ORDER BY m.release_date NULLS LAST
         """
@@ -534,6 +550,32 @@ def get_released_movies_missing_trailer(cur, limit: int) -> list[tuple[int, str,
           AND m.release_date IS NOT NULL AND m.release_date <= CURRENT_DATE
           AND t.movie_id IS NULL
         ORDER BY m.release_date DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return cur.fetchall()
+
+
+def get_released_movies_missing_trailer_training_topup(cur, limit: int) -> list[tuple[int, str, object]]:
+    """Same population as get_released_movies_missing_trailer, restricted to
+    movies released before the GBT time-split cutoff (~2021-07-29). The
+    recency-first ordering on the main query is correct for its own purpose
+    (maximizing YouTube search hit-rate), but it means the training-set side
+    of the split had zero trailer coverage at all - the same coverage-skew
+    bug shape already hit and fixed for critic scores. This companion query
+    exists to close that gap specifically (see planning doc's GBT v3 section).
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.title, m.release_date
+        FROM movies m
+        JOIN box_office_totals bot ON bot.movie_id = m.id
+        LEFT JOIN trailers t ON t.movie_id = m.id
+        WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
+          AND m.release_date IS NOT NULL AND m.release_date < '2021-07-29'
+          AND t.movie_id IS NULL
+        ORDER BY m.release_date ASC
         LIMIT %s
         """,
         (limit,),
@@ -653,6 +695,33 @@ def get_movies_for_bluesky_backfill(cur, limit: int) -> list[dict]:
             ON ss.movie_id = m.id AND ss.stage = 'post_release' AND ss.source = 'bluesky'
         WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
           AND m.release_date IS NOT NULL AND m.release_date <= CURRENT_DATE
+          AND ss.movie_id IS NULL
+        ORDER BY m.release_date ASC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    columns = [desc.name for desc in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def get_movies_for_bluesky_backfill_recent_topup(cur, limit: int) -> list[dict]:
+    """Same population as get_movies_for_bluesky_backfill, restricted to
+    movies released on/after the GBT time-split cutoff (~2021-07-29). The
+    main query's oldest-first ordering is correct for closing historical
+    gaps first, but it means the test-set side of the split had zero
+    coverage - the mirror image of the trailer coverage-skew problem this
+    same pass fixed for YouTube. See planning doc's GBT v3 section.
+    """
+    cur.execute(
+        """
+        SELECT m.id, m.title, m.release_date
+        FROM movies m
+        JOIN box_office_totals bot ON bot.movie_id = m.id
+        LEFT JOIN sentiment_snapshots ss
+            ON ss.movie_id = m.id AND ss.stage = 'post_release' AND ss.source = 'bluesky'
+        WHERE m.budget_usd IS NOT NULL AND m.budget_usd > 0
+          AND m.release_date IS NOT NULL AND m.release_date >= '2021-07-29'
           AND ss.movie_id IS NULL
         ORDER BY m.release_date ASC
         LIMIT %s

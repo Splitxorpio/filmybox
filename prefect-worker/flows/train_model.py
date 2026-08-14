@@ -1,19 +1,25 @@
 """Trains a GBT (LightGBM quantile regression) model on ROI multiple, as a
-real predictor to compare against comp_heuristic_v1 and gbt_v1, both already
-in `verdicts`.
+real predictor to compare against comp_heuristic_v1, gbt_v1, and gbt_v2, all
+already in `verdicts`.
 
 Uses the same target (total_worldwide / budget_usd) and the same
 flop/solid/hit/blockbuster bucket thresholds as the heuristic (imported
 from stage_scan.py, not duplicated - train_model.py lives in the same
 service/package). v1 was pre-release-only features, for a fair comparison
-against the heuristic's own limitation. v2 (current) adds critic-score
-features (imdb/RT/Metacritic/tmdb vote aggregates) - a deliberate departure
-from that "fair to the heuristic" framing, since the whole point of v2 is
-letting predictions sharpen with post-announcement signal. Trailer
-engagement is NOT included yet - as of this pass, zero movies have both
-trailer stats and a known box-office outcome to train against (the 20
-upcoming movies with trailers are all still unreleased); revisit once the
-trailer backfill accumulates enough labeled examples.
+against the heuristic's own limitation. v2 added critic-score features
+(imdb/RT/Metacritic/tmdb vote aggregates). v3 (current) adds sentiment
+features from Bluesky (post_release stage) and YouTube trailer comments -
+both additive/NaN-native, same pattern as v2's critic scores.
+
+Before wiring these in, checked coverage against the time-based train/test
+split and found two coverage-skew bugs (same shape as the one that broke the
+first v2 attempt): YouTube comment coverage was 100% post-cutoff (zero
+training examples) because trailer_backfill.py's movie selection is
+recency-first by design; Bluesky's post_release coverage was the mirror
+image, 100% pre-cutoff (zero test examples), because its backfill is
+oldest-first by design. Fixed with two narrowly-scoped topup flows
+(trailer_backfill_training_topup.py, bluesky_sentiment_topup.py) targeting
+exactly the missing side of each - see planning doc's GBT v3 section.
 
 Batch-precomputes predictions for every movie with a budget (released or
 not) and writes them into `verdicts` with method=MODEL_METHOD - like the
@@ -37,7 +43,7 @@ from db import get_connection, get_latest_stages, get_movies_for_training, upser
 from flows.stage_scan import BUCKET_THRESHOLDS, _bucket
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-MODEL_METHOD = "gbt_v2"
+MODEL_METHOD = "gbt_v3"
 QUANTILES = [0.25, 0.50, 0.75]
 TEST_FRACTION = 0.20
 TOP_N_GENRES = 15
@@ -87,6 +93,13 @@ def _build_features(raw: list[dict]) -> pd.DataFrame:
     df["log_imdb_votes"] = np.log1p(df["imdb_votes"].astype(float))
     df["log_tmdb_vote_count"] = np.log1p(df["tmdb_vote_count"].astype(float))
 
+    df["bluesky_sentiment_score"] = df["bluesky_sentiment_score"].astype(float)
+    df["log_bluesky_volume"] = np.log1p(df["bluesky_volume"].astype(float))
+    df["log_bluesky_avg_engagement"] = np.log1p(df["bluesky_avg_engagement"].astype(float))
+    df["youtube_sentiment_score"] = df["youtube_sentiment_score"].astype(float)
+    df["log_youtube_volume"] = np.log1p(df["youtube_volume"].astype(float))
+    df["log_youtube_avg_engagement"] = np.log1p(df["youtube_avg_engagement"].astype(float))
+
     df["is_franchise"] = df["franchise_id"].notna().astype(int)
     df["primary_director_id"] = df["director_ids"].apply(lambda ids: ids[0] if ids else None)
 
@@ -123,6 +136,12 @@ def _feature_columns(top_genres: list[str]) -> list[str]:
         "metacritic_score",
         "tmdb_vote_average",
         "log_tmdb_vote_count",
+        "bluesky_sentiment_score",
+        "log_bluesky_volume",
+        "log_bluesky_avg_engagement",
+        "youtube_sentiment_score",
+        "log_youtube_volume",
+        "log_youtube_avg_engagement",
     ] + [f"genre_{g}" for g in top_genres]
 
 
@@ -208,7 +227,7 @@ def train_model_flow():
         print(f"[train-model] {MODEL_METHOD} test MAE (log-ROI): {mae_log_roi:.3f}")
         print(f"[train-model] {MODEL_METHOD} bucket accuracy: exact={exact:.1%} within_one={within_one:.1%}")
 
-        for other_method in ("comp_heuristic_v1", "gbt_v1"):
+        for other_method in ("comp_heuristic_v1", "gbt_v1", "gbt_v2"):
             with conn.cursor() as cur:
                 cur.execute(
                     """

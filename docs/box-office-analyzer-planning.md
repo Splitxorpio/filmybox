@@ -812,7 +812,36 @@ Wikipedia infobox turned out to be the better source: **correct-by-construction*
 - `SELECT budget_confidence, count(*) FROM movies GROUP BY budget_confidence` → 3,239 `estimated` / 1,176 `unknown` (up from 2,977/1,438 combined across all budget sources this session — Wikidata's 42 + Wikipedia's 213 + earlier partial runs).
 - Run stopped just short of the full backlog (1,350/1,388 batches) on one last sitelink-batch rate limit — a rerun would pick up the remaining ~38.
 
+### "Already tried" tracking (added 2026-08-12)
+Re-runs on 2026-08-10 revealed a real limitation: `get_movies_missing_budget()` couldn't distinguish "already tried, no Wikipedia budget exists" from "never attempted," so re-running mostly re-scanned the same already-failed movies (two re-runs processed 971 movies combined, matched 0). Fixed with `010_wikipedia_budget_checked.sql` (`movies.wikipedia_budget_checked`, default false) plus `get_movies_missing_budget_unchecked_wikipedia()`/`mark_wikipedia_budget_checked()` in `db.py`. The flag is only set on a **definitive** answer (budget found, no Wikipedia article exists, or the article has no USD field) — a movie that hit `WikipediaRateLimited` and exhausted its retries is deliberately left unchecked, since that's still unknown, not a confirmed "no." Verified: first run under the new logic processed 350 of the 1,175 unchecked movies (0 matched, 350 newly marked checked); an immediate re-run correctly started from 825, not 1,175 — confirming re-runs now make monotonic progress instead of spinning forever.
+
 ### Next steps
-- ~~Rerun `budget_wikipedia_backfill.py` to close the last ~38-movie gap~~ — done, but revealed a real limitation: `get_movies_missing_budget()` has no way to distinguish "already tried, no Wikipedia budget exists" from "never attempted," so re-running mostly re-scans the same already-failed movies. Two re-runs on 2026-08-10 processed 971 movies combined and matched **0** — confirms the first run's 213 was likely close to this source's real ceiling for this corpus, not an artifact of stopping early. Would need a "permanently exhausted" marker (new column or table) to make re-runs productive; not implemented, since the expected yield is low regardless
-- Retrain `gbt_v1`/`gbt_v2` to pick up the 213 newly-budgeted movies — the biggest single-session budget gain so far, worth a fresh retrain
-- Redis caching, automated tests, real Prefect Cloud scheduling, wiring sentiment into `gbt_v3`
+- Continue re-running `budget_wikipedia_backfill.py` — it will now reliably work through the remaining ~825 unchecked movies over successive runs, throttled by Wikipedia's anonymous burst limit but no longer wasting effort on already-failed ones
+- ~~Retrain `gbt_v1`/`gbt_v2` to pick up the 213 newly-budgeted movies~~ — superseded by `gbt_v3` below, which retrains on the latest data anyway
+- Redis caching, automated tests, real Prefect Cloud scheduling
+
+## GBT v3: Sentiment Features (Built)
+
+Wires Bluesky and YouTube trailer-comment sentiment (1,376+ snapshots, previously unused) into the model — flagged as "the top substantive next step" across several recent sections.
+
+### A coverage-skew bug found and fixed before training (not after)
+Checked sentiment coverage against the model's time-based train/test split *before* building the feature, given the exact same bug already broke the first `gbt_v2` attempt. Found two mirror-image problems:
+- **YouTube comments**: 0 movies before the ~2021-07-29 cutoff, 110 after. Root cause: `trailer_backfill.py`'s movie selection (`get_released_movies_missing_trailer`) is deliberately recency-first (maximizes YouTube search hit-rate for movies people actually view), which meant zero training-set coverage.
+- **Bluesky (post_release)**: 1,248 before the cutoff, 0 after. The mirror problem: `get_movies_for_bluesky_backfill`'s oldest-first ordering (deliberately closes historical gaps first) meant zero test-set coverage.
+
+Fixed with two narrowly-scoped topup queries/flows, each targeting exactly the missing side: `get_released_movies_missing_trailer_training_topup`/`trailer_backfill_training_topup.py` (pre-cutoff, feeds the existing unordered `youtube_comment_sentiment.py`) and `get_movies_for_bluesky_backfill_recent_topup`/`bluesky_sentiment_topup.py` (post-cutoff). Ran once each: YouTube training-side coverage 0 → 90, Bluesky test-side coverage 0 → 250. Both are still partial (especially YouTube, quota-bound at ~90/day against ~2,300 training movies with no trailer yet) but enough for a real first evaluation.
+
+### Approach
+- `db.get_movies_for_training()` gained two more joins: `bluesky` (`stage='post_release'`, unique per movie via the existing `(movie_id, stage, source)` constraint — plain `LEFT JOIN` is safe) and `youtube_comments` (no stage filter, since a movie could in principle have a snapshot for either `teaser` or `trailer` — used `LEFT JOIN LATERAL ... LIMIT 1` instead of a plain join to guard against row duplication, since that combination isn't covered by the unique constraint).
+- 6 new additive, `NaN`-native feature columns (same pattern as v2's critic scores): `bluesky_sentiment_score`, `log_bluesky_volume`, `log_bluesky_avg_engagement`, `youtube_sentiment_score`, `log_youtube_volume`, `log_youtube_avg_engagement`.
+- `MODEL_METHOD = "gbt_v3"`; comparison loop extended to 4-way (`comp_heuristic_v1`/`gbt_v1`/`gbt_v2`/`gbt_v3`).
+
+### Verified
+- **4-way accuracy on the same 599-movie holdout**: `gbt_v3` 50.1% exact / 89.0% within-one, vs. `gbt_v2` 48.4%/90.8%, `gbt_v1` 42.0%/86.6%, `comp_heuristic_v1` 36.4%/87.5%. A genuinely mixed result, reported honestly: exact-match improved, within-one-bucket slightly regressed — not an unambiguous win.
+- **Feature importance shows real, uneven signal**: `log_bluesky_avg_engagement` (433 gain) and `log_bluesky_volume` (347) rank #11/#13 of 33 features — ahead of several genre and seasonality features, genuine contribution. `bluesky_sentiment_score` (108) is weaker but present. All three YouTube features rank near the bottom (42/27/27) — consistent with its much thinner coverage (90 training examples vs. Bluesky's 1,248+), not evidence the signal itself is useless.
+- Wrote 3,239 fresh `gbt_v3` verdict rows, coexisting with v1/v2/heuristic in `verdicts` via the existing `(movie_id, stage, method)` schema — no changes needed there.
+
+### Next steps
+- Keep running `trailer_backfill_training_topup.py` (quota-bound, ~90/day) to build real YouTube training-side coverage before drawing firm conclusions about that source specifically
+- Bluesky's signal is real enough now to be worth periodic re-evaluation as `bluesky_sentiment_backfill.py`/`bluesky_sentiment_topup.py` keep running
+- Redis caching, automated tests, real Prefect Cloud scheduling
