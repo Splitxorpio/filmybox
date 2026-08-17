@@ -21,6 +21,14 @@ oldest-first by design. Fixed with two narrowly-scoped topup flows
 (trailer_backfill_training_topup.py, bluesky_sentiment_topup.py) targeting
 exactly the missing side of each - see planning doc's GBT v3 section.
 
+Also does real hyperparameter tuning now (a small grid search over
+num_leaves/learning_rate/min_data_in_leaf, PARAM_GRID below) - LightGBM's
+defaults had been carried forward unchanged since v1 and never actually
+tuned. Uses a proper 3-way time-ordered split (train/val/test): tuning only
+ever sees train+val, the test set stays untouched until the one final
+evaluation, preserving the same held-out discipline every accuracy
+comparison this session has relied on.
+
 Batch-precomputes predictions for every movie with a budget (released or
 not) and writes them into `verdicts` with method=MODEL_METHOD - like the
 heuristic, serving is precompute-and-store, not live in-process (see
@@ -46,7 +54,24 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 MODEL_METHOD = "gbt_v3"
 QUANTILES = [0.25, 0.50, 0.75]
 TEST_FRACTION = 0.20
+VAL_FRACTION = 0.15  # carved out of the pre-test portion, for hyperparameter
+# tuning only - the test set is never touched until the one final evaluation,
+# same discipline the whole session's accuracy comparisons have relied on.
 TOP_N_GENRES = 15
+
+# Small grid, not exhaustive - LightGBM defaults (num_leaves=31,
+# learning_rate=0.05, min_data_in_leaf=10) were carried forward unchanged
+# from v1 through v3 and never actually tuned. Kept intentionally small
+# given ~2,400 training rows: a wide search on this little data would just
+# overfit the validation set's own noise.
+PARAM_GRID = [
+    {"num_leaves": nl, "learning_rate": lr, "min_data_in_leaf": mdl}
+    for nl in (15, 31, 63)
+    for lr in (0.03, 0.05, 0.1)
+    for mdl in (5, 10, 20)
+]
+EARLY_STOPPING_ROUNDS = 20
+MAX_BOOST_ROUNDS = 500
 
 
 def _season_features(release_date) -> tuple[int, int, int]:
@@ -145,7 +170,9 @@ def _feature_columns(top_genres: list[str]) -> list[str]:
     ] + [f"genre_{g}" for g in top_genres]
 
 
-def _train_quantile_models(X_train, y_train, feature_cols) -> dict[float, lgb.Booster]:
+def _train_quantile_models(
+    X_train, y_train, feature_cols, hp: dict, num_boost_round: int
+) -> dict[float, lgb.Booster]:
     train_set = lgb.Dataset(
         X_train[feature_cols], label=y_train, categorical_feature=["mpaa_rating"], free_raw_data=False
     )
@@ -155,16 +182,68 @@ def _train_quantile_models(X_train, y_train, feature_cols) -> dict[float, lgb.Bo
             "objective": "quantile",
             "alpha": q,
             "metric": "quantile",
-            "num_leaves": 31,
-            "min_data_in_leaf": 10,
-            "learning_rate": 0.05,
             "feature_fraction": 0.8,
             "bagging_fraction": 0.8,
             "bagging_freq": 1,
             "verbose": -1,
+            **hp,
         }
-        boosters[q] = lgb.train(params, train_set, num_boost_round=200)
+        boosters[q] = lgb.train(params, train_set, num_boost_round=num_boost_round)
     return boosters
+
+
+def _tune_hyperparameters(train_df, val_df, feature_cols) -> tuple[dict, int]:
+    """Small grid search over PARAM_GRID, using the p50 (median) objective
+    only - tuning all 3 quantile models independently would triple the
+    search cost for the same essential decision (tree complexity/learning
+    rate), and the chosen hyperparameters are applied to all 3 afterward.
+    Selects by validation-set exact-bucket accuracy (the metric actually
+    reported and compared against the other methods), not quantile loss
+    directly - loss and bucket accuracy don't always agree, and bucket
+    accuracy is what matters here. Early stopping on quantile loss picks
+    num_boost_round per candidate; the winning candidate's best_iteration is
+    reused for the final fit.
+    """
+    train_set = lgb.Dataset(
+        train_df[feature_cols], label=train_df["log_roi"], categorical_feature=["mpaa_rating"], free_raw_data=False
+    )
+    val_set = lgb.Dataset(
+        val_df[feature_cols], label=val_df["log_roi"], categorical_feature=["mpaa_rating"], reference=train_set
+    )
+    val_actual_bucket = val_df["roi"].apply(_bucket)
+
+    best = None
+    for hp in PARAM_GRID:
+        params = {
+            "objective": "quantile",
+            "alpha": 0.5,
+            "metric": "quantile",
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "verbose": -1,
+            **hp,
+        }
+        booster = lgb.train(
+            params,
+            train_set,
+            num_boost_round=MAX_BOOST_ROUNDS,
+            valid_sets=[val_set],
+            callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False), lgb.log_evaluation(0)],
+        )
+        val_pred_p50 = np.exp(booster.predict(val_df[feature_cols], num_iteration=booster.best_iteration))
+        val_pred_bucket = pd.Series(val_pred_p50, index=val_df.index).apply(_bucket)
+        exact, within_one = _bucket_accuracy(val_pred_bucket, val_actual_bucket)
+
+        if best is None or exact > best["exact"] or (exact == best["exact"] and within_one > best["within_one"]):
+            best = {"hp": hp, "exact": exact, "within_one": within_one, "num_boost_round": booster.best_iteration}
+
+    print(
+        f"[train-model] tuning: best hp={best['hp']} num_boost_round={best['num_boost_round']} "
+        f"(val exact={best['exact']:.1%} within_one={best['within_one']:.1%}, "
+        f"searched {len(PARAM_GRID)} combos)"
+    )
+    return best["hp"], best["num_boost_round"]
 
 
 def _predict(boosters: dict[float, lgb.Booster], X, feature_cols) -> np.ndarray:
@@ -206,15 +285,26 @@ def train_model_flow():
         feature_cols = _feature_columns(top_genres)
 
         labeled = df[df["roi"].notna()].copy()
-        cutoff_idx = int(len(labeled) * (1 - TEST_FRACTION))
-        train_df = labeled.iloc[:cutoff_idx]
-        test_df = labeled.iloc[cutoff_idx:]
+        test_cutoff_idx = int(len(labeled) * (1 - TEST_FRACTION))
+        train_val_df = labeled.iloc[:test_cutoff_idx]
+        test_df = labeled.iloc[test_cutoff_idx:]
+
+        val_cutoff_idx = int(len(train_val_df) * (1 - VAL_FRACTION / (1 - TEST_FRACTION)))
+        tune_train_df = train_val_df.iloc[:val_cutoff_idx]
+        val_df = train_val_df.iloc[val_cutoff_idx:]
         print(
-            f"[train-model] {len(train_df)} train / {len(test_df)} test "
+            f"[train-model] {len(tune_train_df)} train / {len(val_df)} val / {len(test_df)} test "
             f"(time-split at {test_df.iloc[0]['release_date']})"
         )
 
-        boosters = _train_quantile_models(train_df, train_df["log_roi"], feature_cols)
+        best_hp, best_num_boost_round = _tune_hyperparameters(tune_train_df, val_df, feature_cols)
+
+        # Final fit uses train+val combined (all pre-test data) at the
+        # tuned hyperparameters - the validation split's only job was
+        # picking these, it doesn't need to stay held out for the final model.
+        boosters = _train_quantile_models(
+            train_val_df, train_val_df["log_roi"], feature_cols, best_hp, best_num_boost_round
+        )
 
         test_preds = _predict(boosters, test_df, feature_cols)
         test_df = test_df.copy()
@@ -288,7 +378,7 @@ def train_model_flow():
                 stage = latest_stages.get(movie_id, "post_release" if has_actual else "announcement")
                 p25, p50, p75 = all_preds[i]
                 verdict = {
-                    "comp_count": len(train_df),
+                    "comp_count": len(train_val_df),
                     "roi_multiple_p25": float(p25),
                     "roi_multiple_p50": float(p50),
                     "roi_multiple_p75": float(p75),
