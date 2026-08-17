@@ -292,6 +292,40 @@ _STAGE_RANK_SQL = """
 """
 
 
+def get_sentiment_for_prediction(conn: Connection, movie_id: int) -> dict:
+    """Bluesky (post_release stage) + whichever single youtube_comments
+    snapshot exists for this movie - mirrors prefect-worker/db.py's
+    get_movies_for_training() sentiment joins exactly (same column names),
+    so gbt_predictor.py can build the same features train_model.py trained
+    on. LATERAL for youtube_comments for the same reason as the training
+    query: (movie_id, source) alone isn't covered by the
+    (movie_id, stage, source) unique constraint, so a plain join could in
+    principle return more than one row.
+    """
+    row = conn.execute(
+        text(
+            """
+            SELECT
+                bs.sentiment_score AS bluesky_sentiment_score, bs.volume AS bluesky_volume,
+                bs.avg_engagement_score AS bluesky_avg_engagement,
+                ys.sentiment_score AS youtube_sentiment_score, ys.volume AS youtube_volume,
+                ys.avg_engagement_score AS youtube_avg_engagement
+            FROM (SELECT :movie_id AS id) m
+            LEFT JOIN sentiment_snapshots bs
+                ON bs.movie_id = m.id AND bs.source = 'bluesky' AND bs.stage = 'post_release'
+            LEFT JOIN LATERAL (
+                SELECT sentiment_score, volume, avg_engagement_score
+                FROM sentiment_snapshots
+                WHERE movie_id = m.id AND source = 'youtube_comments'
+                ORDER BY snapshot_date DESC LIMIT 1
+            ) ys ON true
+            """
+        ),
+        {"movie_id": movie_id},
+    ).mappings().first()
+    return dict(row) if row else {}
+
+
 def get_sentiment(conn: Connection, movie_id: int) -> list[dict]:
     rows = conn.execute(
         text(

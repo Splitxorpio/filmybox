@@ -842,6 +842,46 @@ Fixed with two narrowly-scoped topup queries/flows, each targeting exactly the m
 - Wrote 3,239 fresh `gbt_v3` verdict rows, coexisting with v1/v2/heuristic in `verdicts` via the existing `(movie_id, stage, method)` schema — no changes needed there.
 
 ### Next steps
-- Keep running `trailer_backfill_training_topup.py` (quota-bound, ~90/day) to build real YouTube training-side coverage before drawing firm conclusions about that source specifically
-- Bluesky's signal is real enough now to be worth periodic re-evaluation as `bluesky_sentiment_backfill.py`/`bluesky_sentiment_topup.py` keep running
+- ~~Keep running `trailer_backfill_training_topup.py`~~ — done across several sessions (0 → 183 → 272+ training-side movies as of the hyperparameter-tuning pass below); Bluesky's post-cutoff (test-side) coverage backlog is now fully exhausted too
 - Redis caching, automated tests, real Prefect Cloud scheduling
+
+## GBT v3 Hyperparameter Tuning (Built)
+
+LightGBM's parameters (`num_leaves=31`, `learning_rate=0.05`, `min_data_in_leaf=10`) had been carried forward unchanged since `gbt_v1` and never actually tuned. Added a real small grid search (27 combinations: `num_leaves ∈ {15,31,63}` × `learning_rate ∈ {0.03,0.05,0.1}` × `min_data_in_leaf ∈ {5,10,20}` — deliberately small given only ~2,400 training rows, to avoid overfitting the validation set's own noise) plus early stopping to pick `num_boost_round` per candidate.
+
+### Approach
+- **Proper 3-way time-ordered split** (train/val/test), replacing the previous train/test split — tuning only ever sees train+val; the test set stays untouched until the one final evaluation, preserving the held-out discipline every accuracy comparison this session has relied on. `VAL_FRACTION = 0.15` carved out of the pre-test 80%, so the split is ~65/15/20.
+- **Tuned on the p50 (median) objective only**, not all three quantile models independently — tuning triples the search cost for the same essential tree-complexity/learning-rate decision, and the winning hyperparameters are applied to p25/p50/p75 alike for the final fit.
+- **Selected by validation exact-bucket accuracy**, not raw quantile loss — loss and bucket accuracy don't always agree, and bucket accuracy is the metric actually reported and compared against the other methods.
+- Final model refit on train+val combined (all pre-test data) at the winning hyperparameters/iteration count, then evaluated once on the still-untouched test set — unchanged methodology from every prior GBT pass.
+
+### Verified
+- **Best hyperparameters found**: `num_leaves=15, learning_rate=0.03, min_data_in_leaf=5, num_boost_round=313` — simpler trees, slower learning, more rounds than the old defaults, which tracks with a small-dataset regime (less overfitting headroom).
+- **Clean improvement from tuning itself**, same 599-movie test set: 49.6% exact / 90.0% within-one, up from the untuned `gbt_v3`'s 48.9%/89.5% — both metrics improved, not a tradeoff. Now ahead of `gbt_v2` (48.3%) on exact-match, though still slightly behind on within-one (90.8%).
+- **Sentiment features still contribute real signal** under the new hyperparameters: `log_bluesky_avg_engagement`/`log_bluesky_volume` remain solidly mid-pack (~13th/14th of 33 features), and YouTube's `log_youtube_avg_engagement` grew further (86→141 gain) as training-side coverage kept building across sessions. None of the 6 sentiment features show zero importance.
+
+### Next steps
+- ~~Redis caching~~ — done below
+- Automated tests, real Prefect Cloud scheduling
+
+## Redis Caching + Live-Serving gbt_v2→v3 Fix (Built)
+
+Redis had been provisioned since the original scaffold and pinged in `/health`, but never actually cached anything — explicitly deferred earlier as premature. Revisited now for one concrete reason: `GET /movies/{id}/predict` runs live LightGBM inference on every request, a genuinely different cost profile from the rest of the API.
+
+### A real bug found while wiring it up, not caused by it
+While adding caching to `/predict`, found `api/app/gbt_predictor.py`'s `METHOD` had been hardcoded to `"gbt_v2"` this entire time — live serving never picked up `gbt_v3`'s sentiment features or tuned hyperparameters, even though `/verdicts` (batch-precomputed by `train_model.py`) had been showing `gbt_v3` correctly. The two endpoints had been silently inconsistent. Caching a known-stale model's predictions would have been counterproductive, so fixed this first: added `api/app/queries.py:get_sentiment_for_prediction()` (mirrors `prefect-worker/db.py:get_movies_for_training()`'s sentiment joins exactly, same `LATERAL` guard for `youtube_comments` since that source/movie combination isn't covered by the unique constraint), extended `gbt_predictor.py`'s feature-building with the same 6 sentiment columns `train_model.py` uses, and bumped `METHOD` to `"gbt_v3"`. `_metadata["feature_columns"]` already listed the new columns from the existing `feature_metadata_gbt_v3.json`, so no other changes were needed there.
+
+### Approach
+- `api/app/cache.py` (new): `cache_get`/`cache_set`, lazy Redis client singleton, both wrapped in try/except so any Redis failure degrades to a cache miss rather than an error - Redis being down should make the API slower, never broken.
+- Cached exactly 3 endpoints (the ones with real, non-trivial cost): `predict` (TTL 3600s - predictions only change on a manual retrain), `comps` (TTL 900s), `list_movies` (TTL 300s, most likely to reflect freshly-landed backfill data). Left `get_movie`/`get_verdicts`/`get_sentiment` uncached - cheap indexed reads where caching would add complexity for negligible gain.
+- TTL-based expiry only, no explicit invalidation - the flows that change this data run in a separate `prefect-worker` container; real invalidation would need cross-service coupling not justified at this traffic level.
+- Same "check cache, else compute and store" shape already established in this file by `_get_or_fetch_critic_scores`, just Redis instead of a Postgres upsert as the cache layer.
+
+### Verified
+- All 3 endpoints: second call returns byte-identical data to the first (confirmed via diff) and is meaningfully faster (`predict`: 0.92s → 0.09s, a ~10x speedup from skipping live model inference).
+- `redis-cli keys '*'` shows the expected 3 key patterns (`predict:4892`, `comps:4892:embedding:5`, `movies:None:None:None:False:5:0`) with sane TTLs.
+- Stopped the redis container entirely and re-hit `/predict` and `/movies` - both returned clean `200`s (degraded to direct computation), confirming Redis is genuinely optional, not a hard dependency.
+- `/movies/4892/predict` now correctly reports `"method":"gbt_v3"`, matching `/verdicts`.
+
+### Next steps
+- Automated tests, real Prefect Cloud scheduling

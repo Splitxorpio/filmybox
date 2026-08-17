@@ -6,6 +6,7 @@ from sqlalchemy.engine import Connection
 from datetime import datetime, timezone
 
 from app import gbt_predictor, queries
+from app.cache import cache_get, cache_set
 from app.config import settings
 from app.db import get_db
 from app.omdb_client import OMDbRateLimited, fetch_critic_scores
@@ -35,6 +36,11 @@ def list_movies(
     offset: int = Query(0, ge=0),
     conn: Connection = Depends(get_db),
 ):
+    cache_key = f"movies:{genre}:{year}:{search}:{upcoming}:{limit}:{offset}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return MovieListResponse(**cached)
+
     total, rows = queries.list_movies(conn, genre, year, search, limit, offset, upcoming)
     items = [
         MovieSummary(
@@ -49,7 +55,9 @@ def list_movies(
         )
         for row in rows
     ]
-    return MovieListResponse(total=total, limit=limit, offset=offset, items=items)
+    result = MovieListResponse(total=total, limit=limit, offset=offset, items=items)
+    cache_set(cache_key, result.model_dump(mode="json"), ttl_seconds=300)
+    return result
 
 
 def _get_or_fetch_critic_scores(conn: Connection, movie_id: int, imdb_id: str | None) -> CriticScoresOut | None:
@@ -114,11 +122,20 @@ def get_comps(
     method: Literal["embedding", "heuristic"] = "embedding",
     conn: Connection = Depends(get_db),
 ):
+    cache_key = f"comps:{movie_id}:{method}:{limit}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     if queries.get_movie(conn, movie_id) is None:
         raise HTTPException(status_code=404, detail="Movie not found")
     if method == "embedding":
-        return queries.get_comps_by_embedding(conn, movie_id, limit)
-    return queries.get_comps(conn, movie_id, limit)
+        result = queries.get_comps_by_embedding(conn, movie_id, limit)
+    else:
+        result = queries.get_comps(conn, movie_id, limit)
+
+    cache_set(cache_key, [CompOut(**row).model_dump(mode="json") for row in result], ttl_seconds=900)
+    return result
 
 
 @router.get("/{movie_id}/verdicts", response_model=list[VerdictOut])
@@ -137,21 +154,27 @@ def get_sentiment(movie_id: int, conn: Connection = Depends(get_db)):
 
 @router.get("/{movie_id}/predict", response_model=LivePredictionOut)
 def predict(movie_id: int, conn: Connection = Depends(get_db)):
-    """Live gbt_v2 prediction, computed on the spot rather than read from
-    verdicts - covers movies the last batch train_model.py run hasn't
-    reached yet (see planning doc's Model Serving section).
+    """Live prediction (gbt_predictor.METHOD), computed on the spot rather
+    than read from verdicts - covers movies the last batch train_model.py
+    run hasn't reached yet (see planning doc's Model Serving section).
     """
+    cache_key = f"predict:{movie_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return LivePredictionOut(**cached)
+
     movie = queries.get_movie(conn, movie_id)
     if movie is None:
         raise HTTPException(status_code=404, detail="Movie not found")
 
     director_id, actor_id = queries.get_primary_credits(conn, movie_id)
     critic_scores = queries.get_critic_scores(conn, movie_id)
+    sentiment = queries.get_sentiment_for_prediction(conn, movie_id)
 
-    result = gbt_predictor.predict_verdict(movie, director_id, actor_id, critic_scores)
+    result = gbt_predictor.predict_verdict(movie, director_id, actor_id, critic_scores, sentiment)
     now = datetime.now(timezone.utc)
     if result is None:
-        return LivePredictionOut(
+        response = LivePredictionOut(
             roi_multiple_p25=None,
             roi_multiple_p50=None,
             roi_multiple_p75=None,
@@ -160,4 +183,8 @@ def predict(movie_id: int, conn: Connection = Depends(get_db)):
             computed_at=now,
             reason="no budget",
         )
-    return LivePredictionOut(**result, computed_at=now)
+    else:
+        response = LivePredictionOut(**result, computed_at=now)
+
+    cache_set(cache_key, response.model_dump(mode="json"), ttl_seconds=3600)
+    return response

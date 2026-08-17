@@ -1,4 +1,4 @@
-"""Live in-process serving for the gbt_v2 model - Path 1 from the planning
+"""Live in-process serving for the gbt_v3 model - Path 1 from the planning
 doc's Model Serving section (FastAPI loads the boosters into memory, calls
 predict() directly in the request handler, no separate service).
 
@@ -7,8 +7,13 @@ instead of batch, duplicated per this project's established cross-service
 pattern (api/ and prefect-worker/ share no code). No pandas/scikit-learn
 needed here - LightGBM's native Booster.predict() accepts plain lists, and
 the prior-avg-ROI features that train_model.py computes via a pandas
-expanding-mean are exported as static lookup dicts in feature_metadata_gbt_v2.json
+expanding-mean are exported as static lookup dicts in feature_metadata_gbt_v3.json
 for this module to read directly.
+
+Was stuck on METHOD="gbt_v2" for a while after gbt_v3 shipped (missing the
+sentiment features and tuned hyperparameters entirely) - found and fixed
+while wiring up Redis caching for this endpoint, since caching a known-stale
+model's predictions would have been counterproductive.
 
 Lazy-loaded module-level singleton, same shape as
 prefect-worker/embedding_client.py's _get_model().
@@ -21,7 +26,7 @@ import os
 import lightgbm as lgb
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-METHOD = "gbt_v2"
+METHOD = "gbt_v3"
 QUANTILES = [0.25, 0.50, 0.75]
 
 BUCKET_THRESHOLDS = [(1, "flop"), (3, "solid"), (5, "hit")]  # else blockbuster
@@ -60,6 +65,7 @@ def predict_verdict(
     primary_director_id: int | None,
     lead_actor_id: int | None,
     critic_scores: dict | None,
+    sentiment: dict | None = None,
 ) -> dict | None:
     """Returns {"roi_multiple_p25/p50/p75", "verdict_bucket", "method"}, or
     None if the movie has no budget (ROI is undefined without one).
@@ -80,6 +86,7 @@ def predict_verdict(
     mpaa_code = mpaa_categories.index(mpaa_rating) if mpaa_rating in mpaa_categories else math.nan
 
     cs = critic_scores or {}
+    sent = sentiment or {}
     genres = movie.get("genres") or []
 
     features = {
@@ -101,6 +108,20 @@ def predict_verdict(
         "metacritic_score": cs["metacritic_score"] if cs.get("metacritic_score") is not None else math.nan,
         "tmdb_vote_average": cs["tmdb_vote_average"] if cs.get("tmdb_vote_average") is not None else math.nan,
         "log_tmdb_vote_count": math.log1p(cs["tmdb_vote_count"]) if cs.get("tmdb_vote_count") is not None else math.nan,
+        "bluesky_sentiment_score": sent["bluesky_sentiment_score"]
+        if sent.get("bluesky_sentiment_score") is not None
+        else math.nan,
+        "log_bluesky_volume": math.log1p(sent["bluesky_volume"]) if sent.get("bluesky_volume") is not None else math.nan,
+        "log_bluesky_avg_engagement": math.log1p(sent["bluesky_avg_engagement"])
+        if sent.get("bluesky_avg_engagement") is not None
+        else math.nan,
+        "youtube_sentiment_score": sent["youtube_sentiment_score"]
+        if sent.get("youtube_sentiment_score") is not None
+        else math.nan,
+        "log_youtube_volume": math.log1p(sent["youtube_volume"]) if sent.get("youtube_volume") is not None else math.nan,
+        "log_youtube_avg_engagement": math.log1p(sent["youtube_avg_engagement"])
+        if sent.get("youtube_avg_engagement") is not None
+        else math.nan,
     }
     for g in _metadata["genre_columns"]:
         features[f"genre_{g}"] = int(g in genres)
