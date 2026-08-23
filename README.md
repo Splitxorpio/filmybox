@@ -80,8 +80,22 @@ Three methods coexist side-by-side in the `verdicts` table (`method` column), so
 
 `gbt_v3` is served two ways: batch-precomputed into `verdicts` (`prefect-worker/flows/train_model.py`, run after data changes) and live via `GET /movies/{id}/predict` (`api/app/gbt_predictor.py`, in-process LightGBM inference, cached) for movies the last batch run hasn't reached yet.
 
+## Testing
+
+`prefect-worker/tests/` and `api/tests/` cover the pure, deterministic logic in each service (bucket thresholds, stage detection, money-string parsing, lexicon scoring, feature-vector construction, cache round-trips) with plain pytest — no test database or network calls in the suite itself, by design.
+
+```
+docker compose run --rm --no-deps prefect-worker python -m pytest -v
+docker compose up -d redis  # needed for api/tests/test_cache.py
+docker compose run --rm --no-deps api python -m pytest -v
+```
+
+Not yet covered: anything touching Postgres directly (`db.py`/`queries.py`), full API endpoint tests, and external-API client behavior — these need real test-database/fixture infrastructure that's a separate, bigger lift.
+
 ## Status
 
-Built: full ingestion pipeline across 7 sources, pgvector comp search, three-method verdict system with honest accuracy comparison, live + batch model serving, Redis caching, a working dashboard with auth.
+Built: full ingestion pipeline across 7 sources, pgvector comp search, three-method verdict system with honest accuracy comparison, live + batch model serving, Redis caching, automated unit tests, a working dashboard with auth.
+
+Not built: real Prefect Cloud scheduling (everything is still manual `docker compose run` today), Reddit sentiment (code complete, blocked on external approval), DB/endpoint-level test coverage.
 
 For the full history — every decision, every bug found and fixed, every accuracy number along the way — see [`docs/box-office-analyzer-planning.md`](docs/box-office-analyzer-planning.md).

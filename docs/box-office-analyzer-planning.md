@@ -884,4 +884,25 @@ While adding caching to `/predict`, found `api/app/gbt_predictor.py`'s `METHOD` 
 - `/movies/4892/predict` now correctly reports `"method":"gbt_v3"`, matching `/verdicts`.
 
 ### Next steps
-- Automated tests, real Prefect Cloud scheduling
+- ~~Automated tests~~ — done below
+- Real Prefect Cloud scheduling
+
+## Automated Tests v1 (Built)
+
+Zero automated tests existed anywhere in the project until now — every change across 7 data sources, 3 model versions, live serving, and caching had been verified by hand. Scoped deliberately to unit tests for pure/deterministic logic only, no test database or network calls in the suite itself — real integration tests need test-DB fixture infrastructure that's a genuinely bigger lift, and starting there would have meant shipping nothing this pass.
+
+### Approach
+- pytest, one suite per service (`prefect-worker/tests/`, `api/tests/`), matching the existing "these two services share no code" architecture.
+- `prefect-worker/tests/`: `RateLimiter.wait()`'s spacing enforcement, `stage_scan.py`'s `_bucket`/`_percentile`/`detect_stage` (all 5 lifecycle branches), `sentiment_scoring.py`'s `summarize_items` (including the "no lexicon hits → `None`, not `0.0`" distinction), `budget_extraction.py`'s paragraph-splitting and corroboration-margin logic, `wikipedia_client.py`'s `_parse_money` (including the range-midpoint parsing that was a real bug earlier this session).
+- `api/tests/`: `gbt_predictor.py`'s `_bucket`/`_season_features`, the no-budget→`None` path, and a fixture-based test of the full feature-vector construction using fake `Booster` stubs (record the row they're called with, return a fixed value) rather than real trained model files — verifies `NaN` fallback for missing critic/sentiment data, `mpaa_rating` category-index lookup, genre one-hot construction, and the quantile-crossing sort guard (deliberately fed "crossed" fake quantile predictions to confirm the guard actually reorders them). `cache.py`'s get/set round-trip tested against the real redis service (already available for free in the same docker network), plus the graceful-degradation guarantee against a deliberately-unreachable Redis instance.
+- Added `pytest==8.3.3` to both `requirements.txt` files.
+
+### Verified
+- `docker compose run --rm --no-deps prefect-worker python -m pytest -v` → **39 passed**.
+- `docker compose run --rm --no-deps api python -m pytest -v` (with `redis` up) → **12 passed**.
+- Sanity-checked the suite isn't vacuously passing: deliberately broke a `_bucket` boundary assertion, confirmed it actually fails with a clear diff, then reverted and confirmed green again.
+
+### Next steps
+- DB-touching logic (`db.py`/`queries.py`) and full API endpoint tests need real test-database fixture infrastructure - not built this pass
+- External-API client behavior (rate-limit detection, response parsing) currently only verified by hand against the real APIs
+- Real Prefect Cloud scheduling

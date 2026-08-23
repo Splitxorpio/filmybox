@@ -8,3 +8,4 @@ python-dotenv==1.0.1
 httpx==0.28.1
 lightgbm==4.5.0
 bcrypt==4.2.0
+pytest==8.3.3
