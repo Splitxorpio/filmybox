@@ -3,15 +3,19 @@ import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
 import { authOptions } from "@/lib/auth";
+import StageTimeline from "@/app/components/StageTimeline";
 
 const API_INTERNAL_URL = process.env.API_INTERNAL_URL ?? "http://api:8000";
+const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p";
 
 type MovieDetail = {
   id: number;
   title: string;
   release_date: string | null;
   budget_usd: number | null;
+  poster_path: string | null;
   studio: { name: string } | null;
+  box_office_totals: { total_worldwide: number | null } | null;
 };
 
 type Verdict = {
@@ -41,6 +45,7 @@ const METHOD_LABELS: Record<string, string> = {
   comp_heuristic_v1: "Comp Heuristic",
   gbt_v1: "GBT v1",
   gbt_v2: "GBT v2",
+  gbt_v3: "GBT v3",
 };
 
 const BUCKET_STYLES: Record<string, string> = {
@@ -88,6 +93,8 @@ export default async function MovieTimeline({ params }: { params: { id: string }
   // in the UI before now. Each stage's row is frozen once the movie moves
   // past it; only the current stage keeps getting refreshed in place.
   const stagesPresent = STAGE_ORDER.filter((stage) => verdicts.some((v) => v.stage === stage));
+  const isReleased = !!movie.release_date && new Date(movie.release_date) <= new Date();
+  const gbtVerdicts = verdicts.filter((v) => v.method === "gbt_v3");
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-12">
@@ -95,16 +102,42 @@ export default async function MovieTimeline({ params }: { params: { id: string }
         &larr; Back to dashboard
       </Link>
 
-      <div className="mt-4 flex items-baseline justify-between">
-        <h1 className="text-2xl font-bold">{movie.title}</h1>
-        <span className="text-sm text-slate-400">{movie.release_date ?? "TBD"}</span>
-      </div>
-      <p className="mt-1 text-sm text-slate-400">
-        {movie.studio?.name ?? "Unknown studio"}
-        {movie.budget_usd ? ` · $${(movie.budget_usd / 1_000_000).toFixed(0)}M budget` : " · budget unknown"}
-      </p>
+      <div className="mt-4 flex gap-4">
+        {movie.poster_path ? (
+          <img
+            src={`${TMDB_IMAGE_BASE}/w342${movie.poster_path}`}
+            alt={`${movie.title} poster`}
+            className="h-48 w-32 shrink-0 rounded-lg border border-slate-800 object-cover"
+          />
+        ) : (
+          <div className="flex h-48 w-32 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-900 text-xs text-slate-600">
+            No poster
+          </div>
+        )}
+        <div className="flex-1">
+          <div className="flex items-baseline justify-between">
+            <h1 className="text-2xl font-bold">{movie.title}</h1>
+            <span className="text-sm text-slate-400">{movie.release_date ?? "TBD"}</span>
+          </div>
+          <p className="mt-1 text-sm text-slate-400">
+            {movie.studio?.name ?? "Unknown studio"}
+            {movie.budget_usd ? ` · $${(movie.budget_usd / 1_000_000).toFixed(0)}M budget` : " · budget unknown"}
+          </p>
 
-      <h2 className="mt-10 text-lg font-semibold">Prediction Timeline</h2>
+          <h2 className="mt-6 text-lg font-semibold">GBT v3 Timeline</h2>
+          {gbtVerdicts.length === 0 ? (
+            <p className="mt-2 text-sm text-slate-500">No gbt_v3 predictions yet for this movie.</p>
+          ) : (
+            <StageTimeline
+              verdicts={gbtVerdicts}
+              isReleased={isReleased}
+              totalWorldwide={movie.box_office_totals?.total_worldwide ?? null}
+            />
+          )}
+        </div>
+      </div>
+
+      <h2 className="mt-10 text-lg font-semibold">Full Prediction History</h2>
       {stagesPresent.length === 0 ? (
         <p className="mt-2 text-sm text-slate-500">No predictions yet for this movie.</p>
       ) : (

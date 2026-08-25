@@ -67,6 +67,7 @@ class MovieSummary(BaseModel):
     budget_usd: int | None
     studio_name: str | None
     total_worldwide: int | None
+    poster_path: str | None
 
 
 class MovieListResponse(BaseModel):
@@ -86,6 +87,7 @@ class MovieDetail(BaseModel):
     original_language: str | None
     budget_usd: int | None
     budget_confidence: str
+    poster_path: str | None
     studio: StudioOut | None
     franchise: FranchiseOut | None
     credits: list[CreditOut]

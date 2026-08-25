@@ -32,16 +32,17 @@ def list_movies(
     year: int | None = None,
     search: str | None = None,
     upcoming: bool = False,
+    released_only: bool = False,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     conn: Connection = Depends(get_db),
 ):
-    cache_key = f"movies:{genre}:{year}:{search}:{upcoming}:{limit}:{offset}"
+    cache_key = f"movies:{genre}:{year}:{search}:{upcoming}:{released_only}:{limit}:{offset}"
     cached = cache_get(cache_key)
     if cached is not None:
         return MovieListResponse(**cached)
 
-    total, rows = queries.list_movies(conn, genre, year, search, limit, offset, upcoming)
+    total, rows = queries.list_movies(conn, genre, year, search, limit, offset, upcoming, released_only)
     items = [
         MovieSummary(
             id=row["id"],
@@ -52,6 +53,7 @@ def list_movies(
             budget_usd=row["budget_usd"],
             studio_name=row["studio_name"],
             total_worldwide=row["total_worldwide"],
+            poster_path=row["poster_path"],
         )
         for row in rows
     ]
@@ -104,6 +106,7 @@ def get_movie(movie_id: int, conn: Connection = Depends(get_db)):
         original_language=movie["original_language"],
         budget_usd=movie["budget_usd"],
         budget_confidence=movie["budget_confidence"],
+        poster_path=movie["poster_path"],
         studio=StudioOut(id=movie["studio_id"], name=movie["studio_name"]) if movie["studio_id"] else None,
         franchise=(
             FranchiseOut(id=movie["franchise_id"], name=movie["franchise_name"]) if movie["franchise_id"] else None

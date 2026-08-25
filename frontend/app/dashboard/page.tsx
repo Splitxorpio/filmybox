@@ -7,6 +7,7 @@ import { authOptions } from "@/lib/auth";
 // Server-side only - reaches the api container via its docker-compose
 // service name, same reasoning as lib/auth.ts.
 const API_INTERNAL_URL = process.env.API_INTERNAL_URL ?? "http://api:8000";
+const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p";
 
 type MovieSummary = {
   id: number;
@@ -14,6 +15,7 @@ type MovieSummary = {
   release_date: string | null;
   studio_name: string | null;
   budget_usd: number | null;
+  poster_path: string | null;
 };
 
 type Verdict = {
@@ -37,9 +39,12 @@ async function getUpcomingMoviesWithVerdicts(): Promise<MovieWithVerdict[]> {
         cache: "no-store",
       });
       const verdicts = (await res.json()) as Verdict[];
-      // Verdicts are ordered by stage rank ascending - the last gbt_v2 entry
-      // is the movie's current (most advanced) stage prediction.
-      const gbtVerdicts = verdicts.filter((v) => v.method === "gbt_v2");
+      // Verdicts are ordered by stage rank ascending - the last gbt_v3 entry
+      // is the movie's current (most advanced) stage prediction. (Was
+      // hardcoded to gbt_v2 - silently stale since gbt_v3 shipped, same bug
+      // class as gbt_predictor.py's METHOD staleness, found while building
+      // the released-movies page.)
+      const gbtVerdicts = verdicts.filter((v) => v.method === "gbt_v3");
       const current = gbtVerdicts[gbtVerdicts.length - 1] ?? null;
       return { ...movie, verdict: current };
     })
@@ -70,13 +75,17 @@ export default async function Dashboard() {
         <span className="text-sm text-slate-400">{session.user?.email}</span>
       </div>
       <p className="mt-1 text-sm text-slate-400">
-        {movies.length} movies not yet released, with current predictions where available.
+        {movies.length} movies not yet released, with current predictions where available.{" "}
+        <Link href="/dashboard/released" className="text-indigo-400 hover:underline">
+          View released movies &rarr;
+        </Link>
       </p>
 
       <div className="mt-8 overflow-hidden rounded-lg border border-slate-800">
         <table className="w-full text-left text-sm">
           <thead className="bg-slate-900 text-slate-400">
             <tr>
+              <th className="px-4 py-3 font-medium"></th>
               <th className="px-4 py-3 font-medium">Title</th>
               <th className="px-4 py-3 font-medium">Release Date</th>
               <th className="px-4 py-3 font-medium">Studio</th>
@@ -87,6 +96,17 @@ export default async function Dashboard() {
           <tbody className="divide-y divide-slate-800">
             {movies.map((movie) => (
               <tr key={movie.id} className="transition hover:bg-slate-900/50">
+                <td className="px-4 py-3">
+                  {movie.poster_path ? (
+                    <img
+                      src={`${TMDB_IMAGE_BASE}/w92${movie.poster_path}`}
+                      alt=""
+                      className="h-14 w-10 rounded object-cover"
+                    />
+                  ) : (
+                    <div className="h-14 w-10 rounded bg-slate-800" />
+                  )}
+                </td>
                 <td className="px-4 py-3 font-medium">
                   <Link href={`/dashboard/${movie.id}`} className="hover:text-indigo-400 hover:underline">
                     {movie.title}

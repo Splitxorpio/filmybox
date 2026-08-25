@@ -45,12 +45,13 @@ def upsert_movie(cur, movie: dict) -> int:
         INSERT INTO movies (
             tmdb_id, imdb_id, title, release_date, genres, runtime_minutes,
             mpaa_rating, original_language, budget_usd, budget_confidence,
-            franchise_id, studio_id
+            franchise_id, studio_id, poster_path
         )
         VALUES (
             %(tmdb_id)s, %(imdb_id)s, %(title)s, %(release_date)s, %(genres)s,
             %(runtime_minutes)s, %(mpaa_rating)s, %(original_language)s,
-            %(budget_usd)s, %(budget_confidence)s, %(franchise_id)s, %(studio_id)s
+            %(budget_usd)s, %(budget_confidence)s, %(franchise_id)s, %(studio_id)s,
+            %(poster_path)s
         )
         ON CONFLICT (tmdb_id) DO UPDATE SET
             imdb_id = EXCLUDED.imdb_id,
@@ -64,6 +65,7 @@ def upsert_movie(cur, movie: dict) -> int:
             budget_confidence = EXCLUDED.budget_confidence,
             franchise_id = EXCLUDED.franchise_id,
             studio_id = EXCLUDED.studio_id,
+            poster_path = EXCLUDED.poster_path,
             updated_at = now()
         RETURNING id
         """,
@@ -106,6 +108,20 @@ def upsert_movie_credit(
         """,
         (movie_id, person_id, role_type, billing_order, character_name),
     )
+
+
+def get_movies_missing_poster(cur) -> list[tuple[int, int]]:
+    """(movie_id, tmdb_id) for movies with a known tmdb_id but no
+    poster_path yet - candidates for poster_backfill.py's one-time catchup
+    (poster_path is captured going forward by tmdb_backfill.py itself, this
+    is only for the movies ingested before that field was added).
+    """
+    cur.execute("SELECT id, tmdb_id FROM movies WHERE tmdb_id IS NOT NULL AND poster_path IS NULL")
+    return cur.fetchall()
+
+
+def update_movie_poster(cur, movie_id: int, poster_path: str) -> None:
+    cur.execute("UPDATE movies SET poster_path = %s WHERE id = %s", (poster_path, movie_id))
 
 
 def get_movies_missing_budget(cur) -> list[tuple[int, str]]:

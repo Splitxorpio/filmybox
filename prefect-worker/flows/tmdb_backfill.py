@@ -110,6 +110,7 @@ def process_movie(client: TMDbClient, tmdb_id: int) -> None:
                     "budget_confidence": "estimated" if budget else "unknown",
                     "franchise_id": franchise_id,
                     "studio_id": studio_id,
+                    "poster_path": detail.get("poster_path"),
                 }
                 movie_id = upsert_movie(cur, movie_row)
 

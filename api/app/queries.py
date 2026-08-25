@@ -3,7 +3,7 @@ from sqlalchemy.engine import Connection
 
 
 def _build_movie_filters(
-    genre: str | None, year: int | None, search: str | None, upcoming: bool = False
+    genre: str | None, year: int | None, search: str | None, upcoming: bool = False, released_only: bool = False
 ) -> tuple[str, dict]:
     clauses = []
     params: dict = {}
@@ -18,6 +18,8 @@ def _build_movie_filters(
         params["search"] = f"%{search}%"
     if upcoming:
         clauses.append("m.release_date > CURRENT_DATE")
+    if released_only:
+        clauses.append("m.release_date <= CURRENT_DATE")
     where_sql = " AND ".join(clauses) if clauses else "TRUE"
     return where_sql, params
 
@@ -47,8 +49,9 @@ def list_movies(
     limit: int,
     offset: int,
     upcoming: bool = False,
+    released_only: bool = False,
 ) -> tuple[int, list[dict]]:
-    where_sql, params = _build_movie_filters(genre, year, search, upcoming)
+    where_sql, params = _build_movie_filters(genre, year, search, upcoming, released_only)
     order_sql = "m.release_date ASC" if upcoming else "m.release_date DESC NULLS LAST"
 
     total = conn.execute(text(f"SELECT count(*) FROM movies m WHERE {where_sql}"), params).scalar_one()
@@ -58,7 +61,7 @@ def list_movies(
             text(
                 f"""
                 SELECT m.id, m.title, m.release_date, m.genres, m.mpaa_rating, m.budget_usd,
-                       s.name AS studio_name, bot.total_worldwide
+                       m.poster_path, s.name AS studio_name, bot.total_worldwide
                 FROM movies m
                 LEFT JOIN studios s ON s.id = m.studio_id
                 LEFT JOIN box_office_totals bot ON bot.movie_id = m.id
@@ -80,7 +83,7 @@ def get_movie(conn: Connection, movie_id: int) -> dict | None:
         text(
             """
             SELECT m.id, m.imdb_id, m.title, m.release_date, m.genres, m.runtime_minutes, m.mpaa_rating,
-                   m.original_language, m.budget_usd, m.budget_confidence,
+                   m.original_language, m.budget_usd, m.budget_confidence, m.poster_path,
                    s.id AS studio_id, s.name AS studio_name,
                    f.id AS franchise_id, f.name AS franchise_name
             FROM movies m
