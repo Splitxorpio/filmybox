@@ -108,24 +108,30 @@ export default function StageTimeline({
         })}
       </div>
 
-      {isReleased && typeof totalWorldwide === "number" ? (
-        <p className="mt-6 text-sm text-slate-300">
-          Total worldwide box office: <span className="font-semibold text-white">{formatUsd(totalWorldwide)}</span>
-        </p>
-      ) : !isReleased && byStage.size > 0 ? (
-        <p className="mt-6 text-sm text-slate-400">
-          Expected outcome as of the latest stage:{" "}
-          <span className="font-semibold text-white">
-            {(() => {
-              const last = STAGE_ORDER.filter((s) => byStage.has(s)).pop();
-              const v = last ? byStage.get(last) : undefined;
-              return v?.roi_multiple_p50 !== null && v?.roi_multiple_p50 !== undefined
-                ? `${v.roi_multiple_p50.toFixed(2)}x (${v.verdict_bucket ?? "n/a"})`
-                : "n/a";
-            })()}
-          </span>
-        </p>
-      ) : null}
+      {(() => {
+        const lastStage = STAGE_ORDER.filter((s) => byStage.has(s)).pop();
+        const lastVerdict = lastStage ? byStage.get(lastStage) : undefined;
+        const hasPrediction = lastVerdict?.roi_multiple_p50 !== null && lastVerdict?.roi_multiple_p50 !== undefined;
+
+        return (
+          <div className="mt-6 space-y-1">
+            {isReleased && typeof totalWorldwide === "number" && (
+              <p className="text-sm text-slate-300">
+                Total worldwide box office:{" "}
+                <span className="font-semibold text-white">{formatUsd(totalWorldwide)}</span>
+              </p>
+            )}
+            {hasPrediction && (
+              <p className="text-sm text-slate-400">
+                {isReleased ? "Predicted outcome (gbt_v3)" : "Expected outcome as of the latest stage"}:{" "}
+                <span className="font-semibold text-white">
+                  {lastVerdict!.roi_multiple_p50!.toFixed(2)}x ({lastVerdict!.verdict_bucket ?? "n/a"})
+                </span>
+              </p>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }
