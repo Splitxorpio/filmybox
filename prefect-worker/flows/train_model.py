@@ -46,6 +46,7 @@ import os
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from prefect import flow
 
 from db import get_connection, get_latest_stages, get_movies_for_training, upsert_verdict
 from flows.stage_scan import BUCKET_THRESHOLDS, _bucket
@@ -274,6 +275,7 @@ def _bucket_accuracy(pred_bucket: pd.Series, actual_bucket: pd.Series) -> tuple[
     return exact, within_one
 
 
+@flow(name="filmybox-train-model", log_prints=True)
 def train_model_flow():
     conn = get_connection()
     try:

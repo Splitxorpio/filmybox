@@ -14,7 +14,7 @@ That framing drives most of the architectural decisions in this repo: prediction
 |---|---|
 | `api/` | FastAPI backend — REST endpoints for movie data, comps, predictions, sentiment. Redis-cached where compute cost is real (live model inference, vector search). |
 | `prefect-worker/` | All data ingestion and ML training, as plain Python scripts (`flows/`) run via `docker compose run`, not a live Prefect server — see [Data pipeline](#data-pipeline) below. |
-| `frontend/` | Next.js dashboard — auth (NextAuth, credentials-based), an upcoming-movies list with live predictions, and a per-movie stage-by-stage timeline. |
+| `frontend/` | Next.js dashboard — auth (NextAuth, credentials-based), upcoming and released movie lists with posters, and a per-movie visual stage timeline (predicted vs. actual, box office totals). |
 | `postgres` | `pgvector/pgvector` — structured movie data plus vector embeddings for comp-similarity search, in one database. |
 | `redis` | Cache only, no persistence volume — nothing authoritative lives here. |
 
@@ -74,7 +74,7 @@ Three methods coexist side-by-side in the `verdicts` table (`method` column), so
 | `comp_heuristic_v1` | Weighted similarity to comparable movies (genre/cast/director), no ML | 36.4% |
 | `gbt_v1` | LightGBM, pre-release features only (budget, cast/studio/franchise track record) | 42.0% |
 | `gbt_v2` | + critic scores | 48.3% |
-| `gbt_v3` | + social sentiment (Bluesky, YouTube comments), tuned hyperparameters | 49.6% |
+| `gbt_v3` | + social sentiment (Bluesky, YouTube comments), tuned hyperparameters | 50.8% |
 
 *On the same held-out, time-based test set (movies released after the training cutoff — never seen during training). Naive baseline (always guess the most common bucket) is ~35%, for scale.
 

@@ -788,7 +788,7 @@ First real UI — `frontend/` had been an untouched Next.js scaffold all session
 - Dashboard correctly shows real predictions for the 5 budgeted upcoming movies and an honest "no prediction yet" for the other 13 (budget-gap-limited, not a bug — consistent with the earlier budget-source research).
 
 ### Next steps
-- Movie detail/timeline page could extend to non-upcoming (released) movies too — currently only linked from the upcoming-movies dashboard
+- ~~Movie detail/timeline page could extend to non-upcoming (released) movies too~~ — done, see "Released Movies, Posters, and Visual Stage Timeline" below
 - Redis caching, automated tests, real Prefect Cloud scheduling
 - Wire sentiment into the model as `gbt_v3` features (still the top substantive next step, unrelated to the frontend work)
 
@@ -905,4 +905,32 @@ Zero automated tests existed anywhere in the project until now — every change 
 ### Next steps
 - DB-touching logic (`db.py`/`queries.py`) and full API endpoint tests need real test-database fixture infrastructure - not built this pass
 - External-API client behavior (rate-limit detection, response parsing) currently only verified by hand against the real APIs
-- Real Prefect Cloud scheduling
+- ~~Real Prefect Cloud scheduling~~ — still manual, see next section's open item
+
+## Released Movies, Posters, and Visual Stage Timeline (Built)
+
+Direct feedback after shipping the upcoming-movies dashboard: the UI (plain tables, a stacked list of stage cards) didn't visually communicate the actual product thesis — a movie's prediction evolving stage by stage, and how it compares to reality once released. Also closed the gap flagged in the Frontend MVP's own "Next steps": the detail/timeline page had never been linked from anywhere for already-released movies.
+
+### Approach
+- **`GET /movies` gained `released_only: bool`** (mirrors the existing `upcoming` param's shape exactly, `release_date <= CURRENT_DATE`) — additive, not a replacement, so no existing callers changed behavior.
+- **New `/dashboard/released` page**: paginated (25/page), searchable, server-rendered list showing predicted vs. actual bucket per movie with a ✓/✗ correctness indicator — the same N+1 `/verdicts`-per-row pattern the upcoming dashboard already established, now taking the *last* `gbt_v3` verdict (the post-release one) instead of the current-stage one.
+- **Movie posters via TMDb's public image CDN** (`https://image.tmdb.org/t/p/{size}{poster_path}`) — no new API key or auth needed for the images themselves, and `poster_path` was already present in the exact `/movie/{id}` response `tmdb_backfill.py` has always fetched, just never captured. Stored as the raw path fragment (not a full URL) so the frontend picks whatever size fits each context (`w92` list thumbnails, `w342` detail-page image). One-time `poster_backfill.py` flow backfilled the ~4,400 pre-existing movies (TMDb's 20 req/sec limit made this a ~4-minute job, not a quota-throttled multi-day one like the YouTube/Wikipedia sources) — 4,412 of 4,415 matched, 3 transient read timeouts.
+- **New shared `StageTimeline` component** (`frontend/app/components/StageTimeline.tsx`): a horizontal row of 5 connected dot nodes (announcement → teaser → trailer → pre_release → post_release), plain Tailwind/flexbox rather than a charting dependency (`frontend/package.json` had zero chart libraries, consistent with the project's "no new dependency unless truly needed" pattern). Deliberately scoped to `gbt_v3` only, not a repeat of the existing multi-method comparison — the existing full per-stage/per-method breakdown stays on the detail page below the timeline as supplementary detail, not removed. Reached stages are colored by bucket; unreached stages render dimmed, so an upcoming movie still shows genuine visual progress. Released movies show the post-release node's actual bucket/ROI plus total worldwide box office; any movie with a `gbt_v3` prediction shows that prediction's value regardless of release status.
+
+### Bugs found and fixed along the way
+- `dashboard/page.tsx` had `method === "gbt_v2"` hardcoded in its verdict filter — silently stale since `gbt_v3` shipped, the same bug class as the `gbt_predictor.py` `METHOD` staleness bug from the Redis caching pass. Also found `METHOD_LABELS` was missing a `gbt_v3` entry entirely.
+- `StageTimeline`'s summary line originally used a single `isReleased ? boxOfficeLine : expectedOutcomeLine` mutually-exclusive ternary. A movie that had technically crossed its release date but had no box-office data ingested yet (a real, common state — box office lags release) rendered *nothing*, because neither branch's condition was fully satisfied. Fixed by decoupling the two conditions: the box-office line and the predicted/expected-outcome line now render independently, so a `gbt_v3` prediction always shows when one exists.
+- Mid-verification, the whole Docker Desktop engine had gone down between sessions (`open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.` on every `docker compose run`) — all 6 recurring maintenance flows appeared to "succeed" (exit code 0) while actually erroring before ever reaching the containers. Caught by reading the actual output rather than trusting the exit code, restarted Docker Desktop, brought the stack back up (`docker compose up -d`, postgres/redis data volume intact), and reran cleanly.
+
+### Verified
+- `SELECT count(*) FROM movies WHERE poster_path IS NOT NULL` → 4,412 of 4,415.
+- `GET /movies?limit=N` and `GET /movies/{id}` both return real `poster_path` strings.
+- Released movie detail page (`/dashboard/134`, "Cop Out"): poster renders, timeline's post-release node shows "actual: solid (1.85x)" alongside the `gbt_v3` prediction, and "Total worldwide box office: $55.6M" renders correctly.
+- Upcoming movie with a single reached stage (`/dashboard/4905`): timeline dims the unreached Announcement/Teaser/Trailer nodes, fills Pre-release with the `gbt_v3` bucket/value, and the "Expected outcome as of the latest stage" line renders.
+- Both list pages (`/dashboard`, `/dashboard/released`) show poster thumbnails without breaking existing pagination/search; `/dashboard/released?page=2` correctly renders "Page 2 of 177" (confirmed via raw HTML — a plain-text `grep` had initially missed this due to React's hydration comment nodes splitting the text, not an actual rendering bug).
+- Stage-to-stage delta annotations are implemented and wired (computed client-side from consecutive `gbt_v3` verdicts) but not yet exercised by real data — no upcoming movie currently has more than one `gbt_v3`-staged verdict yet, since `gbt_v3` is comparatively new.
+
+### Next steps
+- Real Prefect Cloud scheduling for the recurring maintenance flows (`refresh_recent`, `omdb_trickle`, `stage_scan`, `youtube_comment_sentiment`, `bluesky_buzz_upcoming`, `trailer_backfill`) and `train_model.py` — still entirely manual `docker compose run`, and the Docker-Desktop-down incident above is exactly the kind of silent failure real scheduling/alerting would catch
+- DB-touching logic and full API endpoint tests (unchanged gap from Automated Tests v1)
+- Delta annotations will get real exercise once more upcoming movies accumulate multiple `gbt_v3`-staged verdicts over time

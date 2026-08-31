@@ -23,12 +23,15 @@ for why, and for why this is plain Python, not @flow/@task):
 
 import os
 
+from prefect import flow
+
 from db import get_connection, get_released_movies_missing_trailer, insert_trailer, upsert_trailer_metrics
 from youtube_client import YouTubeQuotaExceeded, get_video_stats, search_trailer
 
 MAX_PER_RUN = 90
 
 
+@flow(name="filmybox-trailer-backfill", log_prints=True)
 def trailer_backfill_flow():
     api_key = os.environ.get("YOUTUBE_API_KEY")
     if not api_key:

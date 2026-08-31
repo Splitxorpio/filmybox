@@ -17,6 +17,8 @@ for why this is plain Python, not @flow/@task):
 
 import os
 
+from prefect import flow
+
 from db import get_connection, get_movies_needing_comment_sentiment, upsert_sentiment_snapshot
 from sentiment_scoring import summarize_items
 from youtube_client import YouTubeQuotaExceeded, get_top_level_comments
@@ -24,6 +26,7 @@ from youtube_client import YouTubeQuotaExceeded, get_top_level_comments
 MAX_PER_RUN = 500
 
 
+@flow(name="filmybox-youtube-comment-sentiment", log_prints=True)
 def youtube_comment_sentiment_flow():
     api_key = os.environ.get("YOUTUBE_API_KEY")
     if not api_key:

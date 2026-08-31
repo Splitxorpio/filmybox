@@ -10,11 +10,14 @@ for why this is plain Python, not @flow/@task):
 
 import os
 
+from prefect import flow
+
 from bluesky_client import BlueskyAuthError, BlueskyRateLimited, search_movie_mentions
 from db import get_connection, get_upcoming_movies_for_sentiment, upsert_sentiment_snapshot
 from sentiment_scoring import summarize_items
 
 
+@flow(name="filmybox-bluesky-buzz-upcoming", log_prints=True)
 def bluesky_buzz_upcoming_flow():
     handle = os.environ.get("BLUESKY_HANDLE")
     app_password = os.environ.get("BLUESKY_APP_PASSWORD")

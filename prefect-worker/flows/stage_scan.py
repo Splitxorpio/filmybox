@@ -23,6 +23,8 @@ and for why this is plain Python, not @flow/@task):
 import os
 from datetime import date, timedelta
 
+from prefect import flow
+
 from db import (
     get_comps_for_verdict,
     get_connection,
@@ -118,6 +120,7 @@ def compute_verdict(cur, movie_id: int, own_budget, own_worldwide) -> dict:
     return verdict
 
 
+@flow(name="filmybox-stage-scan", log_prints=True)
 def stage_scan_flow():
     youtube_api_key = os.environ.get("YOUTUBE_API_KEY")
     today = date.today()
