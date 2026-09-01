@@ -1,0 +1,71 @@
+# Prefect Cloud deployment manifest for the recurring maintenance flows.
+#
+# Registering these (`prefect deploy --all`) requires a real Prefect Cloud
+# workspace/API key - see docs/prefect-cloud-setup.md for the one-time manual
+# setup. Until that's done, every flow still runs exactly as before via
+# `docker compose run --rm --no-deps prefect-worker python -m flows.<name>`;
+# this file has no effect on that.
+#
+# Schedule times are staggered 15 minutes apart so the 6 recurring flows
+# don't all hit their respective external APIs (OMDb/YouTube/Bluesky/TMDb)
+# at the same instant, and train_model runs last so it retrains on the same
+# day's freshly-landed data rather than yesterday's.
+name: filmybox
+prefect-version: ">=3.0,<4.0"
+
+deployments:
+  - name: refresh-recent-daily
+    entrypoint: flows/refresh_recent.py:refresh_recent_flow
+    work_pool:
+      name: filmybox-pool
+    schedule:
+      cron: "0 2 * * *"
+      timezone: UTC
+
+  - name: omdb-trickle-daily
+    entrypoint: flows/omdb_trickle.py:omdb_trickle_flow
+    work_pool:
+      name: filmybox-pool
+    schedule:
+      cron: "15 2 * * *"
+      timezone: UTC
+
+  - name: stage-scan-daily
+    entrypoint: flows/stage_scan.py:stage_scan_flow
+    work_pool:
+      name: filmybox-pool
+    schedule:
+      cron: "30 2 * * *"
+      timezone: UTC
+
+  - name: youtube-comment-sentiment-daily
+    entrypoint: flows/youtube_comment_sentiment.py:youtube_comment_sentiment_flow
+    work_pool:
+      name: filmybox-pool
+    schedule:
+      cron: "45 2 * * *"
+      timezone: UTC
+
+  - name: bluesky-buzz-upcoming-daily
+    entrypoint: flows/bluesky_buzz_upcoming.py:bluesky_buzz_upcoming_flow
+    work_pool:
+      name: filmybox-pool
+    schedule:
+      cron: "0 3 * * *"
+      timezone: UTC
+
+  - name: trailer-backfill-daily
+    entrypoint: flows/trailer_backfill.py:trailer_backfill_flow
+    work_pool:
+      name: filmybox-pool
+    schedule:
+      cron: "15 3 * * *"
+      timezone: UTC
+
+  - name: train-model-daily
+    entrypoint: flows/train_model.py:train_model_flow
+    work_pool:
+      name: filmybox-pool
+    schedule:
+      cron: "0 4 * * *"
+      timezone: UTC
