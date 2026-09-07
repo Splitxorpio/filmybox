@@ -14,6 +14,7 @@ That framing drives most of the architectural decisions in this repo: prediction
 |---|---|
 | `api/` | FastAPI backend — REST endpoints for movie data, comps, predictions, sentiment. Redis-cached where compute cost is real (live model inference, vector search). |
 | `prefect-worker/` | All data ingestion and ML training, as plain Python scripts (`flows/`) run via `docker compose run`, not a live Prefect server — see [Data pipeline](#data-pipeline) below. |
+| `scheduler` | Same image as `prefect-worker`, running `supercronic` against a crontab instead — runs the 6 recurring flows plus `train_model` on a daily schedule. See [`docs/scheduling.md`](docs/scheduling.md). |
 | `frontend/` | Next.js dashboard — auth (NextAuth, credentials-based), upcoming and released movie lists with posters, and a per-movie visual stage timeline (predicted vs. actual, box office totals). |
 | `postgres` | `pgvector/pgvector` — structured movie data plus vector embeddings for comp-similarity search, in one database. |
 | `redis` | Cache only, no persistence volume — nothing authoritative lives here. |
@@ -51,7 +52,7 @@ docs/box-office-analyzer-planning.md
 
 ## Data pipeline
 
-Every `flows/*.py` script is a plain Python function (no `@flow`/`@task` — Prefect's local ephemeral server proved unreliable for long batch jobs), run manually via `docker compose run --rm --no-deps prefect-worker python -m flows.<name>`. Real scheduling (Prefect Cloud) is a known gap, not yet wired in.
+Every `flows/*.py` script is a plain Python function (no `@flow`/`@task` — Prefect's local ephemeral server proved unreliable for long batch jobs, and Prefect Cloud's free tier can't reach this project's local-only database — see [`docs/scheduling.md`](docs/scheduling.md) for why), runnable manually via `docker compose run --rm --no-deps prefect-worker python -m flows.<name>`. The 6 recurring flows plus `train_model` also run automatically once a day via the `scheduler` service (cron, see [`docs/scheduling.md`](docs/scheduling.md)).
 
 | Source | What it provides | Ingestion shape |
 |---|---|---|
@@ -96,6 +97,6 @@ Not yet covered: anything touching Postgres directly (`db.py`/`queries.py`), ful
 
 Built: full ingestion pipeline across 7 sources, pgvector comp search, three-method verdict system with honest accuracy comparison, live + batch model serving, Redis caching, automated unit tests, a working dashboard with auth.
 
-Not built: real Prefect Cloud scheduling (everything is still manual `docker compose run` today), Reddit sentiment (code complete, blocked on external approval), DB/endpoint-level test coverage.
+Not built: Reddit sentiment (code complete, blocked on external approval), DB/endpoint-level test coverage.
 
 For the full history — every decision, every bug found and fixed, every accuracy number along the way — see [`docs/box-office-analyzer-planning.md`](docs/box-office-analyzer-planning.md).

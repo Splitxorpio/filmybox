@@ -1,0 +1,19 @@
+# Recurring maintenance flows, run by the `scheduler` service (supercronic)
+# against this file - see docs/scheduling.md. Staggered so these don't all
+# hit their external APIs (OMDb/YouTube/Bluesky/TMDb) at the same instant,
+# train_model last so it retrains on the day's freshly-landed data rather
+# than yesterday's. 5 minutes apart - each of the 6 recurring flows has
+# consistently finished in well under a minute in practice, so 15-minute
+# spacing was unnecessarily conservative. train_model gets extra buffer
+# (20 min after the last of the 6) since its hyperparameter grid search is
+# the one genuinely heavier job.
+#
+# All times UTC. supercronic logs each job's stdout/stderr straight to this
+# container's own stdout - `docker compose logs -f scheduler` to watch.
+0  7 * * * cd /app && python -m flows.refresh_recent
+5  7 * * * cd /app && python -m flows.omdb_trickle
+10 7 * * * cd /app && python -m flows.stage_scan
+15 7 * * * cd /app && python -m flows.youtube_comment_sentiment
+20 7 * * * cd /app && python -m flows.bluesky_buzz_upcoming
+25 7 * * * cd /app && python -m flows.trailer_backfill
+45 7 * * * cd /app && python -m flows.train_model

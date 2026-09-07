@@ -14,8 +14,6 @@ A real daily schedule is a Prefect Cloud concern once that's configured.
 
 import os
 
-from prefect import flow
-
 from db import get_connection, get_movies_missing_critic_scores, upsert_critic_scores
 from omdb_client import OMDbRateLimited, fetch_critic_scores
 
@@ -24,7 +22,6 @@ from omdb_client import OMDbRateLimited, fetch_critic_scores
 MAX_PER_RUN = 900
 
 
-@flow(name="filmybox-omdb-trickle", log_prints=True)
 def omdb_trickle_flow():
     api_key = os.environ.get("OMDB_API_KEY")
     if not api_key:

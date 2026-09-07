@@ -51,6 +51,23 @@ services:
       postgres:
         condition: service_healthy
 
+  # Runs the recurring flows (refresh_recent, omdb_trickle, stage_scan,
+  # youtube_comment_sentiment, bluesky_buzz_upcoming, trailer_backfill,
+  # train_model) on the schedule in prefect-worker/crontab - see
+  # docs/scheduling.md. Same image/build/volumes as prefect-worker (identical
+  # deps and DB access), just a different command - not a separate Dockerfile.
+  scheduler:
+    build: ./prefect-worker
+    env_file: .env
+    command: supercronic /app/crontab
+    volumes:
+      - ./prefect-worker:/app
+      - ./models:/app/models
+      - huggingface_cache:/root/.cache/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   frontend:
     build: ./frontend
     env_file: .env

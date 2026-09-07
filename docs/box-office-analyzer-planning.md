@@ -931,6 +931,35 @@ Direct feedback after shipping the upcoming-movies dashboard: the UI (plain tabl
 - Stage-to-stage delta annotations are implemented and wired (computed client-side from consecutive `gbt_v3` verdicts) but not yet exercised by real data — no upcoming movie currently has more than one `gbt_v3`-staged verdict yet, since `gbt_v3` is comparatively new.
 
 ### Next steps
-- Real Prefect Cloud scheduling for the recurring maintenance flows (`refresh_recent`, `omdb_trickle`, `stage_scan`, `youtube_comment_sentiment`, `bluesky_buzz_upcoming`, `trailer_backfill`) and `train_model.py` — still entirely manual `docker compose run`, and the Docker-Desktop-down incident above is exactly the kind of silent failure real scheduling/alerting would catch
+- ~~Real Prefect Cloud scheduling~~ — attempted, then replaced with a local cron scheduler; see "Recurring Flow Scheduling" below
 - DB-touching logic and full API endpoint tests (unchanged gap from Automated Tests v1)
 - Delta annotations will get real exercise once more upcoming movies accumulate multiple `gbt_v3`-staged verdicts over time
+
+## Recurring Flow Scheduling: Prefect Cloud Attempted, Then Local Cron (Built)
+
+Direct follow-up to the Docker-Desktop-down incident above: every recurring flow was still entirely manual `docker compose run`, so a downed Docker Desktop engine produced 6 silent failures (misleading exit code 0 from the outer pipeline) rather than a caught, alerted failure. `README.md` had already committed to a specific answer for real scheduling — Prefect Cloud, not self-hosted — so that was attempted first, not treated as an open design choice.
+
+### The Prefect Cloud attempt, and why it was reverted
+All 7 recurring flows (`refresh_recent`, `omdb_trickle`, `stage_scan`, `youtube_comment_sentiment`, `bluesky_buzz_upcoming`, `trailer_backfill`, `train_model`) were wrapped with `@flow(name=..., log_prints=True)`, matching the one existing usage in `flows/hello_flow.py`. A `prefect-worker/prefect.yaml` was written defining one deployment per flow with staggered daily cron schedules (15 minutes apart, to avoid all 6 hitting their external APIs at once; `train_model` last, so it retrains on the day's freshly-landed data). `worker_entrypoint.py` was given a conditional swap: run `prefect worker start --pool filmybox-pool` when `PREFECT_API_KEY` is set, else keep the original healthcheck-loop scaffolding.
+
+Once the user created a real Prefect Cloud account and added `PREFECT_API_KEY`/`PREFECT_API_URL` to `.env`, `prefect work-pool create filmybox-pool --type process` returned **"Your plan does not support hybrid or push work pools"** — the free tier only allows `prefect:managed` pools, confirmed by successfully creating one with `--type prefect:managed` instead. This is a structural dead end, not a tier-upgrade inconvenience: `prefect:managed` runs flow code on Prefect's own infrastructure, which has no network path to this project's Postgres/Redis (both local-only, inside the Docker Compose network only). A managed-pool deployment would fail every run trying to connect to the DB, regardless of plan cost.
+
+There was also a second, independent reason to abandon the `@flow` decorators even before this was discovered: with no Cloud workspace actually receiving state, every decorated flow run was spinning up a temporary local Prefect server for orchestration bookkeeping (visible in the logs as `Starting temporary server on http://127.0.0.1:...`) — exactly the "local ephemeral server proved unreliable for long batch jobs" failure mode the flows' own docstrings have warned about since the very first ones were written. This was directly observed: running the 6 recurring flows in parallel produced repeated `sqlite3.OperationalError: database is locked` errors from the temp servers' own telemetry writes colliding with each other. The errors were confined to Prefect's internal event-emission side channel and didn't corrupt any real flow output, but it was a live demonstration of the exact risk, not a hypothetical one.
+
+### The replacement: `supercronic` in a new `scheduler` service
+- All 7 `@flow` decorators removed, `prefect-worker/prefect.yaml` deleted, `worker_entrypoint.py`'s conditional swap reverted — back to plain functions and the original unconditional healthcheck loop.
+- New `prefect-worker/crontab`: the same 7 flows, same staggered daily UTC schedule already designed for the (deleted) `prefect.yaml`, expressed as plain cron lines (`cd /app && python -m flows.<name>`).
+- New `scheduler` service in `docker-compose.yml`: same image/build/volumes as `prefect-worker` (identical deps and DB access, no separate Dockerfile), command overridden to `supercronic /app/crontab`. Chose `supercronic` over plain cron specifically because it logs straight to stdout (visible via `docker compose logs -f scheduler`, consistent with how every other service's logs are already read in this project) and exits nonzero on a malformed crontab — plain cron does neither, logging to syslog instead and silently ignoring bad lines.
+- `supercronic` installed via the official Dockerfile install snippet from its GitHub release page (pinned version `v0.2.49`, sha1sum-verified against the release's own published checksum) rather than a floating "latest" download.
+- New `docs/scheduling.md`: the schedule table, how to watch logs, how to run a flow ad-hoc without waiting for its cron time, how to validate the crontab after editing it, and the Prefect Cloud dead-end explained above (so it isn't silently re-attempted later without this context).
+
+### Verified
+- `docker compose run --rm --no-deps prefect-worker python -m pytest -v` → 39 passed after the `@flow` revert (the one flaky timing test from the initial attempt passed clean here too).
+- A flow run via the unchanged manual invocation (`python -m flows.omdb_trickle`) now shows only its own `print()` output — no `Starting temporary server` line, confirming the revert actually removed the local-server overhead.
+- `docker compose run --rm --no-deps scheduler supercronic -test /app/crontab` → `crontab is valid`.
+- `docker compose up -d scheduler` starts cleanly and stays up (not crash-looping); `docker compose exec scheduler sh -c "cd /app && python -m flows.omdb_trickle"` confirmed one crontab line's exact command works standalone inside the running container.
+- Deleted the orphaned `filmybox-pool` (`prefect:managed`) work pool from the Prefect Cloud workspace via `prefect work-pool delete`, since nothing uses it.
+
+### Next steps
+- A real re-attempt at Prefect Cloud (or any hosted orchestrator) would need either a paid plan with hybrid work pool support, or exposing the database publicly — neither is planned
+- No alerting yet on a `scheduler` job failure (e.g. a quota-exceeded exit) beyond what's visible in `docker compose logs` — acceptable at this project's scale, revisit if that changes

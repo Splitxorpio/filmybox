@@ -14,8 +14,6 @@ for why, and for why this is plain Python, not @flow/@task):
 
 import os
 
-from prefect import flow
-
 from db import (
     ensure_critic_scores_row,
     get_connection,
@@ -29,7 +27,6 @@ from tmdb_client import TMDbClient
 RECENT_DAYS = 90
 
 
-@flow(name="filmybox-refresh-recent", log_prints=True)
 def refresh_recent_flow():
     omdb_api_key = os.environ.get("OMDB_API_KEY")
     tmdb_client = TMDbClient()
