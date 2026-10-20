@@ -51,3 +51,7 @@ Prints `crontab is valid` or a parse error with the offending line — useful af
 ## Why not Prefect Cloud
 
 `prefect>=3.0,<4.0` is in `requirements.txt` and was tried first — `@flow`-decorating each flow and registering deployments via `prefect deploy`. That approach was reverted after confirming live against a real Prefect Cloud workspace that the free tier only supports `prefect:managed` work pools, not `process` (hybrid/self-hosted-worker) pools (`prefect work-pool create --type process` returns "Your plan does not support hybrid or push work pools"). `prefect:managed` runs flow code on Prefect's own infrastructure, which has no network path to this project's Postgres/Redis — both local-only, inside the Docker Compose network — so it's a structural mismatch, not just a free-tier inconvenience. Revisiting this would need either a paid Prefect Cloud plan (for a real hybrid work pool) or exposing the database to the internet, neither of which this project does.
+
+## Failure alerts
+
+Every crontab line runs through `prefect-worker/run_job.py`, which streams the flow's output to the container log as before and, if the flow exits nonzero (crash, uncaught exception), posts the last 15 output lines to `ALERT_WEBHOOK_URL`. Set it in `.env` to a Discord or Slack incoming-webhook URL; if blank, failures are only logged. A flow that stops cleanly on a rate limit exits 0 and does not alert. Restart the scheduler (`docker compose up -d --build scheduler`) after changing `.env` or the crontab.
