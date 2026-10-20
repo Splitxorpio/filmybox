@@ -54,4 +54,8 @@ Prints `crontab is valid` or a parse error with the offending line — useful af
 
 ## Failure alerts
 
-Every crontab line runs through `prefect-worker/run_job.py`, which streams the flow's output to the container log as before and, if the flow exits nonzero (crash, uncaught exception), posts the last 15 output lines to `ALERT_WEBHOOK_URL`. Set it in `.env` to a Discord or Slack incoming-webhook URL; if blank, failures are only logged. A flow that stops cleanly on a rate limit exits 0 and does not alert. Restart the scheduler (`docker compose up -d --build scheduler`) after changing `.env` or the crontab.
+Every crontab line runs through `prefect-worker/run_job.py`, which streams the flow's output to the container log as before and, if the flow exits nonzero (crash, uncaught exception), pushes a notification with the last lines of output to the [ntfy.sh](https://ntfy.sh) topic in `NTFY_TOPIC`. If it's blank, failures are only logged. A flow that stops cleanly on a rate limit exits 0 and does not alert.
+
+Setup: install the ntfy app on your phone, subscribe to a long random topic name, and put the same name in `.env` as `NTFY_TOPIC`. On the public server anyone who knows the topic can read or post to it, so don't use a guessable name. Restart with `docker compose up -d --build scheduler` after changing `.env` or the crontab.
+
+Test: `docker compose exec scheduler sh -c "cd /app && python run_job.py flows.nonexistent"` should push an alert.

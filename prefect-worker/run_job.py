@@ -6,8 +6,9 @@ Usage (from the crontab):
 Output is streamed straight through to this process's stdout so
 `docker compose logs scheduler` looks the same as before. The alert fires on
 a nonzero exit or a crash; a flow that stops cleanly on a rate limit (exit 0)
-is not treated as a failure. ALERT_WEBHOOK_URL accepts a Discord or Slack
-incoming webhook; if unset, failures are just logged.
+is not treated as a failure. Alerts go to an ntfy.sh topic (NTFY_TOPIC, on
+the server at NTFY_URL, default https://ntfy.sh); if unset, failures are just
+logged.
 """
 
 import collections
@@ -21,14 +22,22 @@ TAIL_LINES = 15
 
 
 def send_alert(job, code, tail):
-    url = os.environ.get("ALERT_WEBHOOK_URL")
-    if not url:
-        print(f"[run_job] {job} failed (exit {code}); ALERT_WEBHOOK_URL not set, no alert sent")
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        print(f"[run_job] {job} failed (exit {code}); NTFY_TOPIC not set, no alert sent")
         return
-    text = f"filmybox job `{job}` failed (exit {code})\n```\n{tail}\n```"[:1900]
+    base = os.environ.get("NTFY_URL", "https://ntfy.sh").rstrip("/")
     try:
-        # "content" is Discord's field, "text" is Slack's; each ignores the other.
-        httpx.post(url, json={"content": text, "text": text}, timeout=10).raise_for_status()
+        httpx.post(
+            f"{base}/{topic}",
+            content=tail[-3000:].encode(),
+            headers={
+                "Title": f"filmybox: {job} failed (exit {code})",
+                "Priority": "high",
+                "Tags": "rotating_light",
+            },
+            timeout=10,
+        ).raise_for_status()
     except httpx.HTTPError as e:
         print(f"[run_job] could not send alert for {job}: {e}")
 
